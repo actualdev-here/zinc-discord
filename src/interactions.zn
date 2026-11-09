@@ -1,0 +1,152 @@
+use 'zinc-json' as json
+use 'zinc-net' as wire
+use './client.zn' as connected
+use './models.zn' as models
+use './rest.zn' as rest
+use './response_state.zn' as life
+use './router.zn' as routes
+
+# Never copy or log the secret-bearing controller; share the same pointer.
+# The Client must outlive it. Its token-free store deduplicates controller creation.
+pub struct InteractionContext [
+    ptr connected.Client client
+    models.Command command
+    life.ResponseState state
+    str error
+]
+
+pub fn new_interaction [ptr connected.Client client, connected.Event event] ptr InteractionContext [
+    ptr InteractionContext context = sys.alloc 1
+    if [not context] [ = null ]
+    models.Command command = models.decode_command event.data
+    life.ResponseState state = life.new_response_state event.received_ms
+    str error = ''
+    if [not state.ok] [ error = state.error ]
+    if [not client or not event.ok or not str.eq event.name, 'INTERACTION_CREATE' or not command.ok] [
+        state = life.new_response_state [0 sub 1]
+        error = 'invalid application command interaction'
+    ]
+    if [str.len error eq 0] [
+        json.Integer now = wire.clock_ms []
+        if [not now.ok] [
+            state = life.new_response_state [0 sub 1]
+            error = 'interaction clock failed'
+        ]
+        else [
+            if [not str.eq [life.response_phase state, now.value], 'pending'] [
+                error = 'initial response deadline exhausted'
+            ]
+            else [
+                if [not connected.claim_interaction client, command.application_id, command.id] [
+                    state = life.new_response_state [0 sub 1]
+                    error = connected.interaction_claim_error client
+                ]
+            ]
+        ]
+    ]
+    # Invalid/replayed events must not reach application handlers via the router.
+    if [str.len error gt 0] [ command = models.decode_command '{}' ]
+    context[0] = InteractionContext [client, command, state, error]
+    = context
+]
+
+pub fn close_interaction [ptr InteractionContext context] int [
+    if [context] [ sys.free context ]
+    = 0
+]
+
+pub fn interaction_command [ptr InteractionContext context] models.Command [
+    if [not context] [ = models.decode_command '{}' ]
+    = context[0].command
+]
+
+pub fn interaction_error [ptr InteractionContext context] str [
+    if [not context] [ = 'interaction allocation failed' ]
+    = context[0].error
+]
+
+pub fn interaction_phase [ptr InteractionContext context] str [
+    if [not context] [ = 'invalid' ]
+    json.Integer now = wire.clock_ms []
+    if [not now.ok] [ = 'invalid' ]
+    = life.response_phase context[0].state, now.value
+]
+
+# Sample at admission, never from the queued event's receipt timestamp.
+pub fn resolve_interaction [ptr routes.Router router, ptr InteractionContext context] routes.RouteMatch [
+    json.Integer now = wire.clock_ms []
+    if [not context or not now.ok] [ = routes.RouteMatch [false, 'interaction or clock unavailable', 0, '', '[]', 'interaction_unavailable', '', 0] ]
+    if [not str.eq [life.response_phase context[0].state, now.value], 'pending'] [ = routes.RouteMatch [false, 'interaction cannot dispatch after response or expiry', 0, '', '[]', 'interaction_unavailable', '', 0] ]
+    = routes.resolve_command_at router, context[0].command, now.value
+]
+
+# Call while polling, even during idle periods, to keep modular clocks current.
+pub fn service_router [ptr routes.Router router] bool [
+    json.Integer now = wire.clock_ms []
+    if [not now.ok] [ = false ]
+    = routes.advance_router router, now.value
+]
+
+fn rejected [ptr InteractionContext context, str error] connected.Response [
+    if [context] [ context[0].error = error ]
+    = connected.Response [false, 0, '', error, 0]
+]
+
+fn initial [ptr InteractionContext context, str payload, bool defer] connected.Response [
+    if [not context] [ = rejected context, 'interaction allocation failed' ]
+    json.Integer now = wire.clock_ms []
+    if [not now.ok] [ = rejected context, 'interaction clock failed' ]
+    int budget = life.response_remaining context[0].state, now.value
+    if [budget le 150] [ = rejected context, 'initial response deadline exhausted' ]
+    life.ResponseState claimed = life.begin_response context[0].state, defer, now.value
+    if [not claimed.ok] [ = rejected context, claimed.error ]
+    # Claim before any network call, not after success. Preserve ambiguous outcomes.
+    context[0].state = claimed
+    models.Command command = context[0].command
+    rest.Request request = rest.interaction_callback command.id, command.token, payload
+    connected.Execution result = connected.execute_for context[0].client, request, [budget sub 150]
+    connected.Response response = result.response
+    context[0].state = life.finish_response context[0].state, response.ok, result.dispatched, response.status
+    context[0].error = response.error
+    = response
+]
+
+pub fn interaction_reply_to [ptr InteractionContext context, str content, bool ephemeral] connected.Response [
+    json.Text payload = rest.interaction_reply content, ephemeral
+    if [not payload.ok] [ = rejected context, 'invalid interaction reply content' ]
+    = initial context, payload.value, false
+]
+
+pub fn interaction_defer [ptr InteractionContext context, bool ephemeral] connected.Response [
+    str payload = rest.deferred_reply ephemeral
+    = initial context, payload, true
+]
+
+fn later [ptr InteractionContext context, str content, bool followup, bool ephemeral] connected.Response [
+    if [not context] [ = rejected context, 'interaction allocation failed' ]
+    json.Integer now = wire.clock_ms []
+    if [not now.ok] [ = rejected context, 'interaction clock failed' ]
+    str phase = life.response_phase context[0].state, now.value
+    if [not str.eq phase, 'replied' and not str.eq phase, 'deferred'] [ = rejected context, 'interaction is not acknowledged or has expired' ]
+    if [followup and str.eq phase, 'deferred'] [ = rejected context, 'complete deferred response before creating followups' ]
+    int budget = life.response_remaining context[0].state, now.value
+    if [budget le 150] [ = rejected context, 'interaction token deadline exhausted' ]
+    budget = budget sub 150
+    if [budget gt 15000] [ budget = 15000 ]
+    models.Command command = context[0].command
+    rest.Request request = rest.edit_original_response command.application_id, command.token, content
+    if [followup] [ request = rest.create_followup command.application_id, command.token, content, ephemeral ]
+    connected.Execution result = connected.execute_for context[0].client, request, budget
+    connected.Response response = result.response
+    if [response.ok and not followup] [ context[0].state = life.complete_response context[0].state ]
+    context[0].error = response.error
+    = response
+]
+
+pub fn interaction_edit [ptr InteractionContext context, str content] connected.Response [
+    = later context, content, false, false
+]
+
+pub fn interaction_followup [ptr InteractionContext context, str content, bool ephemeral] connected.Response [
+    = later context, content, true, ephemeral
+]

@@ -1,0 +1,125 @@
+use './permissions.zn' as permissions
+use './models.zn' as models
+use './rest.zn' as rest
+
+pub struct CommandPolicy [
+    pub bool ok
+    pub str error
+    bool valid
+    int context
+    str user
+    str guild
+    permissions.PermissionSet member
+    permissions.PermissionSet app
+    int duration
+    int scope
+]
+
+pub struct PolicyCheck [
+    pub bool ok
+    pub str code
+    pub str error
+]
+
+fn bad_policy [] CommandPolicy [
+    permissions.PermissionSet zero = permissions.parse_permissions '0'
+    = CommandPolicy [false, 'invalid command policy', false, 0, '', '', zero, zero, 0, 0]
+]
+
+pub fn new_policy [] CommandPolicy [
+    permissions.PermissionSet zero = permissions.parse_permissions '0'
+    = CommandPolicy [true, '', true, 0, '', '', zero, zero, 0, 0]
+]
+
+# Public status is diagnostic; toggling it must not rehabilitate failed state.
+pub fn valid_policy [CommandPolicy policy] bool [ = policy.ok and policy.valid ]
+
+# Context: 0 any, 1 guild only, 2 DM only. Modifiers preserve the original.
+pub fn policy_context [CommandPolicy policy, int context] CommandPolicy [
+    if [not valid_policy policy or context lt 0 or context gt 2] [ = bad_policy [] ]
+    if [context ne 1 and [str.len policy.guild gt 0 or not permissions.permissions_empty policy.member or policy.scope eq 2]] [ = bad_policy [] ]
+    policy.context = context
+    = policy
+]
+
+pub fn policy_user [CommandPolicy policy, str user_id] CommandPolicy [
+    if [not valid_policy policy or not rest.snowflake user_id] [ = bad_policy [] ]
+    policy.user = user_id
+    = policy
+]
+
+pub fn policy_guild [CommandPolicy policy, str guild_id] CommandPolicy [
+    if [not valid_policy policy or policy.context eq 2 or not rest.snowflake guild_id] [ = bad_policy [] ]
+    policy.guild = guild_id
+    policy.context = 1
+    = policy
+]
+
+pub fn policy_permissions [CommandPolicy policy, str member_mask, str app_mask] CommandPolicy [
+    if [not valid_policy policy] [ = bad_policy [] ]
+    permissions.PermissionSet member = permissions.parse_permissions member_mask
+    permissions.PermissionSet app = permissions.parse_permissions app_mask
+    if [not member.ok or not app.ok] [ = bad_policy [] ]
+    if [not permissions.permissions_empty member] [
+        if [policy.context eq 2] [ = bad_policy [] ]
+        policy.context = 1
+    ]
+    policy.member = member
+    policy.app = app
+    = policy
+]
+
+# One admission per window. Scope: 1 user (across guilds), 2 guild, 3 channel,
+# 4 global. Each route/application is always a separate namespace.
+pub fn policy_cooldown [CommandPolicy policy, int duration_ms, int scope] CommandPolicy [
+    if [not valid_policy policy or duration_ms lt 1 or duration_ms gt 900000 or scope lt 1 or scope gt 4] [ = bad_policy [] ]
+    if [scope eq 2] [
+        if [policy.context eq 2] [ = bad_policy [] ]
+        policy.context = 1
+    ]
+    policy.duration = duration_ms
+    policy.scope = scope
+    = policy
+]
+
+fn rejected [str code, str error] PolicyCheck [
+    = PolicyCheck [false, code, error]
+]
+
+fn permitted [permissions.PermissionSet actual, permissions.PermissionSet required, bool guild] bool [
+    if [not actual.ok] [ = false ]
+    if [guild and permissions.permission_bit actual, 3] [ = true ]
+    = permissions.permissions_include actual, required
+]
+
+# Only the effective interaction snapshot is evaluated. This is not a role
+# hierarchy/overwrite engine, role membership check, or remote permission fetch.
+pub fn check_policy [CommandPolicy policy, models.Command command] PolicyCheck [
+    if [not valid_policy policy] [ = rejected 'invalid_policy', 'invalid command policy' ]
+    if [not command.ok or not rest.snowflake command.application_id or not rest.snowflake command.user_id] [ = rejected 'invalid_command', 'invalid policy command identity' ]
+    bool guild = str.len command.guild_id gt 0
+    if [[guild and not rest.snowflake command.guild_id] or [str.len command.channel_id gt 0 and not rest.snowflake command.channel_id]] [ = rejected 'invalid_command', 'invalid policy command location' ]
+    if [policy.context eq 1 and not guild] [ = rejected 'guild_required', 'command requires a guild' ]
+    if [policy.context eq 2 and guild] [ = rejected 'dm_required', 'command requires a direct message' ]
+    if [str.len policy.user gt 0 and not str.eq policy.user, command.user_id] [ = rejected 'user_denied', 'command user not allowed' ]
+    if [str.len policy.guild gt 0 and not str.eq policy.guild, command.guild_id] [ = rejected 'guild_denied', 'command guild not allowed' ]
+    if [not permissions.permissions_empty policy.member] [
+        if [not command.member_permissions.ok] [ = rejected 'member_permissions_unavailable', 'member permissions unavailable' ]
+        if [not permitted command.member_permissions, policy.member, guild] [ = rejected 'member_permissions', 'member permissions insufficient' ]
+    ]
+    if [not permissions.permissions_empty policy.app] [
+        if [not command.app_permissions.ok] [ = rejected 'app_permissions_unavailable', 'application permissions unavailable' ]
+        if [not permitted command.app_permissions, policy.app, guild] [ = rejected 'app_permissions', 'application permissions insufficient' ]
+    ]
+    if [policy.scope eq 3 and not rest.snowflake command.channel_id] [ = rejected 'channel_required', 'command cooldown requires a channel' ]
+    = PolicyCheck [true, '', '']
+]
+
+# Internal immutable accessors used by the router, not exported by the facade.
+pub fn cooldown_duration [CommandPolicy policy] int [ = policy.duration ]
+pub fn cooldown_subject [CommandPolicy policy, models.Command command] str [
+    if [policy.scope eq 1] [ = command.user_id ]
+    if [policy.scope eq 2] [ = command.guild_id ]
+    if [policy.scope eq 3] [ = command.channel_id ]
+    = '0'
+]

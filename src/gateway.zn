@@ -1,0 +1,211 @@
+use 'zinc-json' as json
+
+# Pure state machine; caller supplies time deltas and a random jitter in 0..1000.
+# action: none/send/event/reconnect/fatal. Clear after consumption with tick(0).
+pub struct Gateway [
+    pub str token
+    pub int intents
+    pub str sequence
+    pub str session_id
+    pub str resume_url
+    pub int interval_ms
+    pub int due_ms
+    pub bool awaiting_ack
+    pub bool active
+    pub str action
+    pub str payload
+    pub str event
+    pub str data
+    pub int retry_ms
+]
+
+pub fn intents_default [] int [ = 1 ]
+# Guilds + guild messages + direct messages; message content is opt-in (32768).
+pub fn intents_messages [] int [ = 4609 ]
+
+fn token_valid [str token] bool [
+    int n = str.len token
+    if [n eq 0 or n gt 512] [ = false ]
+    int i = 0
+    while [i lt n] [
+        int c = str.at token, i
+        if [c lt 33 or c gt 126] [ = false ]
+        i = i add 1
+    ]
+    = true
+]
+
+pub fn identify [str token, int intents] json.Text [
+    if [not token_valid token or intents lt 0] [ = json.Text [false, ''] ]
+    str body = str.concat '{"op":2,"d":{"token":', json.quote token
+    body = str.concat body, ',"intents":'
+    body = str.concat body, int.str intents
+    body = str.concat body, ',"properties":{"os":"linux","browser":"zinc-discord","device":"zinc-discord"}}}'
+    = json.Text [true, body]
+]
+
+pub fn heartbeat [str sequence] json.Text [
+    if [str.len sequence gt 20] [ = json.Text [false, ''] ]
+    if [not str.eq sequence, 'null'] [
+        if [not json.unsigned_decimal sequence] [ = json.Text [false, ''] ]
+    ]
+    str body = str.concat '{"op":1,"d":', sequence
+    = json.Text [true, str.concat body, '}']
+]
+
+pub fn resume [str token, str session_id, str sequence] json.Text [
+    int n = str.len session_id
+    if [not token_valid token or n eq 0 or n gt 256 or str.len sequence gt 20 or not json.unsigned_decimal sequence] [ = json.Text [false, ''] ]
+    if [not json.valid json.quote session_id] [ = json.Text [false, ''] ]
+    str body = str.concat '{"op":6,"d":{"token":', json.quote token
+    body = str.concat body, ',"session_id":'
+    body = str.concat body, json.quote session_id
+    body = str.concat body, ',"seq":'
+    body = str.concat body, sequence
+    = json.Text [true, str.concat body, '}}']
+]
+
+pub fn new_gateway [str token, int intents] Gateway [
+    Gateway state = Gateway [token, intents, 'null', '', '', 0, 0, false, false, 'none', '', '', '', 0]
+    json.Text payload = identify token, intents
+    if [not payload.ok] [ state.action = 'fatal' ]
+    = state
+]
+
+fn clear_action [Gateway state] Gateway [
+    state.action = 'none'
+    state.payload = ''
+    state.event = ''
+    state.data = ''
+    state.retry_ms = 0
+    = state
+]
+
+pub fn connected [Gateway state] Gateway [
+    if [str.eq state.action, 'fatal'] [ = state ]
+    state = clear_action state
+    state.active = false
+    state.interval_ms = 0
+    state.awaiting_ack = false
+    = state
+]
+
+fn forget [Gateway state] Gateway [
+    state.sequence = 'null'
+    state.session_id = ''
+    state.resume_url = ''
+    = state
+]
+
+fn reconnect [Gateway state, int delay] Gateway [
+    state.active = false
+    state.awaiting_ack = false
+    state.action = 'reconnect'
+    state.retry_ms = delay
+    = state
+]
+
+fn invalid [Gateway state] Gateway [ = reconnect state, 1000 ]
+
+pub fn receive [Gateway state, str frame, int jitter] Gateway [
+    if [str.eq state.action, 'fatal'] [ = state ]
+    state = clear_action state
+    if [jitter lt 0 or jitter gt 1000] [ = invalid state ]
+    json.Text opcode_raw = json.member frame, 'op'
+    json.Integer opcode = json.unsigned_int opcode_raw.value
+    json.Text data = json.member frame, 'd'
+    if [not opcode_raw.ok or not opcode.ok] [ = invalid state ]
+    if [opcode.value eq 10] [
+        if [state.active] [ = invalid state ]
+        json.Text interval_raw = json.member data.value, 'heartbeat_interval'
+        json.Integer interval = json.unsigned_int interval_raw.value
+        if [not interval.ok or interval.value lt 1 or interval.value gt 86400000] [ = invalid state ]
+        state.interval_ms = interval.value
+        # Split the product to avoid signed 32-bit overflow; round down < 1ms.
+        int whole = interval.value div 1000 mul jitter
+        int fraction = interval.value mod 1000 mul jitter div 1000
+        state.due_ms = whole add fraction
+        state.active = true
+        state.awaiting_ack = false
+        json.Text payload = resume state.token, state.session_id, state.sequence
+        if [not payload.ok] [ payload = identify state.token, state.intents ]
+        if [not payload.ok] [
+            state.action = 'fatal'
+            = state
+        ]
+        state.action = 'send'
+        state.payload = payload.value
+        = state
+    ]
+    if [not state.active] [ = invalid state ]
+    if [opcode.value eq 11] [
+        state.awaiting_ack = false
+        = state
+    ]
+    if [opcode.value eq 1] [
+        json.Text payload = heartbeat state.sequence
+        state.action = 'send'
+        state.payload = payload.value
+        state.awaiting_ack = true
+        = state
+    ]
+    if [opcode.value eq 7] [ = reconnect state, 1000 ]
+    if [opcode.value eq 9] [
+        if [not str.eq data.value, 'true' and not str.eq data.value, 'false'] [ = invalid state ]
+        if [str.eq data.value, 'false'] [ state = forget state ]
+        int delay = 1000 add [jitter mul 4]
+        = reconnect state, delay
+    ]
+    if [opcode.value eq 0] [
+        json.Text sequence = json.member frame, 's'
+        json.Text name_raw = json.member frame, 't'
+        json.Text name = json.text name_raw.value
+        if [not sequence.ok or str.len sequence.value gt 20 or not json.unsigned_decimal sequence.value or not name.ok or str.len name.value eq 0 or not data.ok] [ = invalid state ]
+        if [str.eq name.value, 'READY'] [
+            json.Text session_raw = json.member data.value, 'session_id'
+            json.Text session = json.text session_raw.value
+            json.Text url_raw = json.member data.value, 'resume_gateway_url'
+            json.Text url = json.text url_raw.value
+            if [not session.ok or str.len session.value eq 0 or str.len session.value gt 256 or not url.ok or not str.starts url.value, 'wss://'] [ = invalid state ]
+            state.session_id = session.value
+            state.resume_url = url.value
+        ]
+        state.sequence = sequence.value
+        state.action = 'event'
+        state.event = name.value
+        state.data = data.value
+        = state
+    ]
+    # Ignore unknown opcodes for forward compatibility.
+    = state
+]
+
+pub fn tick [Gateway state, int elapsed_ms] Gateway [
+    if [str.eq state.action, 'fatal' or str.eq state.action, 'reconnect'] [ = state ]
+    state = clear_action state
+    if [elapsed_ms lt 0] [ = invalid state ]
+    if [not state.active] [ = state ]
+    if [elapsed_ms lt state.due_ms] [
+        state.due_ms = state.due_ms sub elapsed_ms
+        = state
+    ]
+    if [state.awaiting_ack] [ = reconnect state, 1000 ]
+    json.Text payload = heartbeat state.sequence
+    state.action = 'send'
+    state.payload = payload.value
+    state.awaiting_ack = true
+    state.due_ms = state.interval_ms
+    = state
+]
+
+pub fn disconnected [Gateway state, int close_code] Gateway [
+    if [str.eq state.action, 'fatal'] [ = state ]
+    state = clear_action state
+    if [close_code eq 4004 or close_code ge 4010 and close_code le 4014] [
+        state.active = false
+        state.action = 'fatal'
+        = state
+    ]
+    if [close_code eq 1000 or close_code eq 1001 or close_code eq 4007 or close_code eq 4009] [ state = forget state ]
+    = reconnect state, 1000
+]

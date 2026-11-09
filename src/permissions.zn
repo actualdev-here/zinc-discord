@@ -1,0 +1,66 @@
+# Bounded uint64 bitsets, represented by four base-65536 limbs. Never pass
+# permission strings through int32/float. Wider future masks fail closed.
+pub struct PermissionSet [
+    pub bool ok
+    int low
+    int middle
+    int high
+    int top
+]
+
+pub fn parse_permissions [str value] PermissionSet [
+    PermissionSet result = PermissionSet [false, 0, 0, 0, 0]
+    int n = str.len value
+    if [n lt 1 or n gt 20 or [n gt 1 and str.at value, 0 eq 48]] [ = result ]
+    int i = 0
+    while [i lt n] [
+        int digit = str.at value, i
+        if [digit lt 48 or digit gt 57] [ = PermissionSet [false, 0, 0, 0, 0] ]
+        int carry = result.low mul 10 add [digit sub 48]
+        result.low = carry mod 65536
+        carry = result.middle mul 10 add [carry div 65536]
+        result.middle = carry mod 65536
+        carry = result.high mul 10 add [carry div 65536]
+        result.high = carry mod 65536
+        carry = result.top mul 10 add [carry div 65536]
+        if [carry ge 65536] [ = PermissionSet [false, 0, 0, 0, 0] ]
+        result.top = carry
+        i = i add 1
+    ]
+    result.ok = true
+    = result
+]
+
+pub fn permissions_empty [PermissionSet value] bool [
+    = value.ok and value.low eq 0 and value.middle eq 0 and value.high eq 0 and value.top eq 0
+]
+
+pub fn permission_bit [PermissionSet value, int bit] bool [
+    if [not value.ok or bit lt 0 or bit gt 63] [ = false ]
+    int limb = value.low
+    if [bit ge 16] [ limb = value.middle ]
+    if [bit ge 32] [ limb = value.high ]
+    if [bit ge 48] [ limb = value.top ]
+    int power = 1
+    int i = bit mod 16
+    while [i gt 0] [ power = power mul 2
+        i = i sub 1
+    ]
+    = limb div power mod 2 eq 1
+]
+
+fn includes_limb [int value, int required] bool [
+    while [required gt 0] [
+        if [required mod 2 eq 1 and value mod 2 eq 0] [ = false ]
+        required = required div 2
+        value = value div 2
+    ]
+    = true
+]
+
+# Literal containment only. The policy layer applies guild-only Administrator
+# semantics; a DM mask with bit 3 must not become an all-permissions grant.
+pub fn permissions_include [PermissionSet value, PermissionSet required] bool [
+    if [not value.ok or not required.ok] [ = false ]
+    = includes_limb value.low, required.low and includes_limb value.middle, required.middle and includes_limb value.high, required.high and includes_limb value.top, required.top
+]

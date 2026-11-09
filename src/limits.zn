@@ -1,0 +1,33 @@
+# Per-bucket/global wait gate. Transport supplies rounded-up header/body delays.
+# This is NOT an HTTP executor or an automatic retry loop.
+pub struct Gate [
+    pub int remaining_ms
+    pub bool failed
+]
+
+pub fn new_gate [] Gate [ = Gate [0, false] ]
+
+# Both Retry-After and X-RateLimit-Reset-After are seconds on the wire.
+# The transport must parse and round UP to milliseconds before calling this.
+pub fn block [Gate gate, int retry_ms] Gate [
+    if [retry_ms lt 1 or retry_ms gt 86400000] [
+        gate.failed = true
+        = gate
+    ]
+    if [retry_ms gt gate.remaining_ms] [ gate.remaining_ms = retry_ms ]
+    = gate
+]
+
+pub fn advance [Gate gate, int elapsed_ms] Gate [
+    if [elapsed_ms lt 0] [
+        gate.failed = true
+        = gate
+    ]
+    if [elapsed_ms ge gate.remaining_ms] [ gate.remaining_ms = 0 ]
+    else [ gate.remaining_ms = gate.remaining_ms sub elapsed_ms ]
+    = gate
+]
+
+pub fn can_send [Gate global_gate, Gate bucket_gate] bool [
+    = not global_gate.failed and not bucket_gate.failed and global_gate.remaining_ms eq 0 and bucket_gate.remaining_ms eq 0
+]

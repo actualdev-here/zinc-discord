@@ -1,0 +1,256 @@
+use 'zinc-json' as json
+use './commands.zn' as commands
+use './models.zn' as models
+
+pub struct ArgumentCheck [
+    pub bool ok
+    pub str code
+    pub str error
+    pub str parameter
+]
+
+# Exact decimal comparison against builder integer endpoints/choices. No int32
+# truncation or float rounding of incoming 53-bit integers or NUMBER tokens.
+struct Decimal [
+    str digits
+    int magnitude
+    bool negative
+]
+
+fn decimal [str source] Decimal [
+    int start = 0
+    bool negative = str.starts source, '-'
+    if [negative] [ start = 1 ]
+    int stop = str.len source
+    int point = stop
+    int i = start
+    while [i lt stop] [
+        int c = str.at source, i
+        if [c eq 46] [ point = i ]
+        if [c eq 101 or c eq 69] [ stop = i
+            break
+        ]
+        i = i add 1
+    ]
+    int exponent = 0
+    if [stop lt str.len source] [
+        i = stop add 1
+        bool minus = str.at source, i eq 45
+        if [minus or str.at source, i eq 43] [ i = i add 1 ]
+        while [i lt str.len source] [
+            int digit = str.at source, i
+            # Saturation is safe relative to <=512 KiB JSON and int32 schema
+            # endpoints. Extreme exponents never alias a nonzero endpoint.
+            if [exponent lt 1000000] [ exponent = exponent mul 10 add [digit sub 48]
+                if [exponent gt 1000000] [ exponent = 1000000 ]
+            ]
+            i = i add 1
+        ]
+        if [minus] [ exponent = 0 sub exponent ]
+    ]
+    str digits = str.slice source, start, stop
+    int fraction = 0
+    if [point lt stop] [
+        digits = str.concat [str.slice source, start, point], [str.slice source, [point add 1], stop]
+        fraction = stop sub point sub 1
+    ]
+    i = 0
+    while [i lt str.len digits and str.at digits, i eq 48] [ i = i add 1 ]
+    digits = str.slice digits, i, str.len digits
+    if [str.len digits eq 0] [ = Decimal ['', 0, false] ]
+    int magnitude = str.len digits add exponent sub fraction
+    = Decimal [digits, magnitude, negative]
+]
+
+fn number_compare [str left, str right] int [
+    Decimal a = decimal left
+    Decimal b = decimal right
+    if [a.negative ne b.negative] [
+        if [a.negative] [ = 0 sub 1 ]
+        = 1
+    ]
+    int result = 0
+    if [str.len a.digits eq 0 and str.len b.digits ne 0] [ result = 0 sub 1 ]
+    else [ if [str.len b.digits eq 0 and str.len a.digits ne 0] [ result = 1 ]
+        else [
+            if [a.magnitude lt b.magnitude] [ result = 0 sub 1 ]
+            if [a.magnitude gt b.magnitude] [ result = 1 ]
+            if [result eq 0] [
+                int i = 0
+                int width = str.len a.digits
+                if [str.len b.digits gt width] [ width = str.len b.digits ]
+                while [i lt width] [
+                    int x = 48
+                    int y = 48
+                    if [i lt str.len a.digits] [ x = str.at a.digits, i ]
+                    if [i lt str.len b.digits] [ y = str.at b.digits, i ]
+                    if [x lt y] [ result = 0 sub 1
+                        break
+                    ]
+                    if [x gt y] [ result = 1
+                        break
+                    ]
+                    i = i add 1
+                ]
+            ]
+        ]
+    ]
+    if [a.negative] [ result = 0 sub result ]
+    = result
+]
+
+fn text_field [str source, str key] str [
+    json.Text raw = json.member source, key
+    json.Text value = json.text raw.value
+    = value.value
+]
+
+fn find_option [str options, str name] json.Text [
+    int i = 0
+    while [i lt 25] [
+        json.Text item = json.element options, i
+        if [not item.ok] [ break ]
+        if [str.eq [text_field item.value, 'name'], name] [ = item ]
+        i = i add 1
+    ]
+    = json.Text [false, '']
+]
+
+fn has_branches [str options] bool [
+    json.Text first = json.element options, 0
+    json.Text kind = json.member first.value, 'type'
+    = str.eq kind.value, '1' or str.eq kind.value, '2'
+]
+
+# Module bridge used by the router; accepts only immutable builder roots and
+# actual leaf paths. There is deliberately no raw-JSON schema constructor.
+pub fn route_schema [commands.Definition definition, str path] json.Text [
+    json.Text node = commands.slash_schema definition
+    int start = 0
+    int depth = 0
+    while [node.ok and depth lt 3] [
+        int end = start
+        while [end lt str.len path and str.at path, end ne 32] [ end = end add 1 ]
+        str part = str.slice path, start, end
+        if [not str.eq part, text_field node.value, 'name'] [ = json.Text [false, ''] ]
+        json.Text options = json.member node.value, 'options'
+        if [end eq str.len path] [
+            if [not options.ok or has_branches options.value] [ = json.Text [false, ''] ]
+            = options
+        ]
+        if [not has_branches options.value] [ = json.Text [false, ''] ]
+        start = end add 1
+        end = start
+        while [end lt str.len path and str.at path, end ne 32] [ end = end add 1 ]
+        node = find_option options.value, str.slice path, start, end
+        depth = depth add 1
+    ]
+    = json.Text [false, '']
+]
+
+fn failed [str code, str error, str parameter] ArgumentCheck [
+    # parameter comes only from the local schema, never untrusted option names,
+    # option values, raw payloads or secret-bearing interaction tokens.
+    = ArgumentCheck [false, code, error, parameter]
+]
+
+fn scalar [str schema, models.CommandOption option] ArgumentCheck [
+    str name = text_field schema, 'name'
+    json.Text raw_kind = json.member schema, 'type'
+    json.Integer kind = json.unsigned_int raw_kind.value
+    if [not option.ok or kind.value ne option.kind] [ = failed 'option_type', 'command argument type mismatch', name ]
+    json.Text minimum = json.member schema, 'min_value'
+    json.Text maximum = json.member schema, 'max_value'
+    if [kind.value eq 3] [
+        json.Text text = json.text option.value
+        int length = 0
+        int i = 0
+        while [i lt str.len text.value] [
+            int c = str.at text.value, i
+            if [c lt 128 or c ge 192] [ length = length add 1 ]
+            i = i add 1
+        ]
+        minimum = json.member schema, 'min_length'
+        maximum = json.member schema, 'max_length'
+        json.Integer lower = json.unsigned_int minimum.value
+        json.Integer upper = json.unsigned_int maximum.value
+        if [not text.ok or length gt 6000 or [lower.ok and length lt lower.value] or [upper.ok and length gt upper.value]] [ = failed 'option_length', 'command argument length outside schema', name ]
+    ]
+    if [kind.value eq 4 or kind.value eq 10] [
+        if [kind.value eq 10] [
+            if [number_compare option.value, '-9007199254740992' lt 0 or number_compare option.value, '9007199254740992' gt 0] [ = failed 'option_range', 'command number outside supported domain', name ]
+        ]
+        if [[minimum.ok and number_compare option.value, minimum.value lt 0] or [maximum.ok and number_compare option.value, maximum.value gt 0]] [ = failed 'option_range', 'command argument outside schema range', name ]
+    ]
+    json.Text choices = json.member schema, 'choices'
+    if [choices.ok] [
+        int i = 0
+        bool found = false
+        while [i lt 25] [
+            json.Text entry = json.element choices.value, i
+            if [not entry.ok] [ break ]
+            json.Text value = json.member entry.value, 'value'
+            if [kind.value eq 3] [
+                json.Text wanted = json.text value.value
+                json.Text actual = json.text option.value
+                if [str.eq wanted.value, actual.value] [ found = true ]
+            ]
+            else [ if [number_compare option.value, value.value eq 0] [ found = true ] ]
+            i = i add 1
+        ]
+        if [not found] [ = failed 'option_choice', 'command argument is not a registered choice', name ]
+    ]
+    = ArgumentCheck [true, '', '', '']
+]
+
+# Internal entry point: schema is a leaf array obtained from route_schema;
+# the caller must validate incoming option syntax before using it.
+pub fn validate_options [str schema, str options] ArgumentCheck [
+    int i = 0
+    while [i lt 25] [
+        json.Text actual = json.element options, i
+        if [not actual.ok] [ break ]
+        str name = text_field actual.value, 'name'
+        json.Text expected = find_option schema, name
+        if [not expected.ok] [ = failed 'unknown_option', 'command argument not present in schema', '' ]
+        models.CommandOption option = models.command_option options, name
+        ArgumentCheck checked = scalar expected.value, option
+        if [not checked.ok] [ = checked ]
+        i = i add 1
+    ]
+    i = 0
+    while [i lt 25] [
+        json.Text expected = json.element schema, i
+        if [not expected.ok] [ break ]
+        json.Text required = json.member expected.value, 'required'
+        str name = text_field expected.value, 'name'
+        json.Text actual = find_option options, name
+        if [str.eq required.value, 'true' and not actual.ok] [ = failed 'missing_required', 'required command argument missing', name ]
+        i = i add 1
+    ]
+    = ArgumentCheck [true, '', '', '']
+]
+
+pub fn validate_command [commands.Definition definition, models.Command command] ArgumentCheck [
+    json.Text root = commands.slash_schema definition
+    if [not root.ok] [ = failed 'invalid_definition', 'invalid slash command definition', '' ]
+    if [not command.ok or not models.valid_command_options command.options] [ = failed 'invalid_command', 'invalid command invocation', '' ]
+    if [command.command_type ne 1 or not str.eq command.name, text_field root.value, 'name'] [ = failed 'command_mismatch', 'command does not match definition', '' ]
+    str options = command.options
+    json.Text schema = json.member root.value, 'options'
+    int depth = 0
+    while [has_branches schema.value and depth lt 2] [
+        json.Text selected = json.element options, 0
+        str name = text_field selected.value, 'name'
+        json.Text expected = find_option schema.value, name
+        json.Text actual_kind = json.member selected.value, 'type'
+        json.Text expected_kind = json.member expected.value, 'type'
+        if [not expected.ok or not str.eq actual_kind.value, expected_kind.value] [ = failed 'invalid_branch', 'selected command branch not present in schema', '' ]
+        schema = json.member expected.value, 'options'
+        json.Text children = json.member selected.value, 'options'
+        options = '[]'
+        if [children.ok] [ options = children.value ]
+        depth = depth add 1
+    ]
+    = validate_options schema.value, options
+]

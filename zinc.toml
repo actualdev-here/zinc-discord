@@ -1,0 +1,9 @@
+[package]
+name = "zinc-discord"
+version = "0.1.0"
+kind = "library"
+entry = "src/lib.zn"
+
+[dependencies]
+zinc-net = { git = "https://github.com/actualdev-here/zinc-net.git", tag = "v0.1.0", version = "^0.1.0" }
+zinc-json = { git = "https://github.com/actualdev-here/zinc-json.git", tag = "v0.1.0", version = "^0.1.0" }

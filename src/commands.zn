@@ -1,0 +1,262 @@
+use 'zinc-json' as json
+use './rest.zn' as rest
+
+# Immutable builder values. Private state cannot be forged by consuming modules.
+pub struct Definition [
+    pub bool ok
+    pub str error
+    int scope
+    bool required
+    str name
+    str value
+    int kind
+    int bounds
+    int lower
+    int upper
+    str choices
+    int choice_count
+]
+
+pub struct Definitions [
+    pub bool ok
+    pub str error
+    int role
+    int count
+    int mode
+    bool optional_seen
+    str value
+]
+
+fn bad_definition [] Definition [
+    = Definition [false, 'invalid command definition', 0, false, '', '', 0, 0, 0, 0, '[]', 0]
+]
+
+fn bad_list [] Definitions [
+    = Definitions [false, 'invalid command definition list', 0, 0, 0, false, '']
+]
+
+fn name_valid [str name] bool [
+    int n = str.len name
+    if [n lt 1 or n gt 32] [ = false ]
+    int i = 0
+    while [i lt n] [
+        int c = str.at name, i
+        if [[c lt 97 or c gt 122] and [c lt 48 or c gt 57] and c ne 45 and c ne 95] [ = false ]
+        i = i add 1
+    ]
+    = true
+]
+
+fn description_valid [str description] bool [
+    int n = str.len description
+    # Conservative UTF-8 byte cap, not a claim to implement Unicode character counting.
+    = n ge 1 and n le 100 and json.valid json.quote description
+]
+
+fn base [int kind, str name, str description] str [
+    str value = str.concat '{"type":', int.str kind
+    value = str.concat value, ',"name":'
+    value = str.concat value, json.quote name
+    value = str.concat value, ',"description":'
+    = str.concat value, json.quote description
+]
+
+pub fn new_options [] Definitions [
+    = Definitions [true, '', 0, 0, 0, false, '[]']
+]
+
+pub fn new_commands [] Definitions [
+    = Definitions [true, '', 1, 0, 0, false, '[]']
+]
+
+pub fn command_parameter [int kind, str name, str description, bool required] Definition [
+    if [kind lt 3 or kind gt 11 or not name_valid name or not description_valid description] [ = bad_definition [] ]
+    str value = base kind, name, description
+    if [required] [ value = str.concat value, ',"required":true}' ]
+    else [ value = str.concat value, ',"required":false}' ]
+    = Definition [true, '', 0, required, name, value, kind, 0, 0, 0, '[]', 0]
+]
+
+fn render [Definition item] str [
+    str value = str.slice item.value, 0, [str.len item.value sub 1]
+    if [item.bounds ne 0] [
+        if [item.bounds eq 1] [ value = str.concat value, ',"min_length":' ]
+        else [ value = str.concat value, ',"min_value":' ]
+        value = str.concat value, int.str item.lower
+        if [item.bounds eq 1] [ value = str.concat value, ',"max_length":' ]
+        else [ value = str.concat value, ',"max_value":' ]
+        value = str.concat value, int.str item.upper
+    ]
+    if [item.choice_count gt 0] [
+        value = str.concat value, ',"choices":'
+        value = str.concat value, item.choices
+    ]
+    = str.concat value, '}'
+]
+
+# Apply bounds before choices; a second bounds modifier is an error, not duplicate JSON.
+pub fn parameter_length [Definition item, int minimum, int maximum] Definition [
+    if [not item.ok or item.scope ne 0 or item.kind ne 3 or item.bounds ne 0 or item.choice_count ne 0 or minimum lt 0 or maximum lt 1 or maximum gt 6000 or minimum gt maximum] [ = bad_definition [] ]
+    item.bounds = 1
+    item.lower = minimum
+    item.upper = maximum
+    = item
+]
+
+pub fn parameter_range [Definition item, int minimum, int maximum] Definition [
+    if [not item.ok or item.scope ne 0 or [item.kind ne 4 and item.kind ne 10] or item.bounds ne 0 or item.choice_count ne 0 or minimum gt maximum] [ = bad_definition [] ]
+    item.bounds = 2
+    item.lower = minimum
+    item.upper = maximum
+    = item
+]
+
+fn choice [Definition item, str label, str value] Definition [
+    if [not item.ok or item.scope ne 0 or item.choice_count ge 25 or not description_valid label] [ = bad_definition [] ]
+    int i = 0
+    while [i lt item.choice_count] [
+        json.Text previous_entry = json.element item.choices, i
+        json.Text raw = json.member previous_entry.value, 'name'
+        json.Text previous = json.text raw.value
+        if [str.eq previous.value, label] [ = bad_definition [] ]
+        i = i add 1
+    ]
+    str entry = str.concat '{"name":', json.quote label
+    entry = str.concat entry, ',"value":'
+    entry = str.concat entry, value
+    entry = str.concat entry, '}'
+    item.choices = str.slice item.choices, 0, [str.len item.choices sub 1]
+    if [item.choice_count gt 0] [ item.choices = str.concat item.choices, ',' ]
+    item.choices = str.concat item.choices, entry
+    item.choices = str.concat item.choices, ']'
+    item.choice_count = item.choice_count add 1
+    = item
+]
+
+pub fn string_choice [Definition item, str label, str value] Definition [
+    if [not item.ok or item.kind ne 3 or str.len value gt 100 or not json.valid json.quote value] [ = bad_definition [] ]
+    # Count Unicode codepoints only after strict UTF-8 validation above.
+    int length = 0
+    int i = 0
+    while [i lt str.len value] [
+        int c = str.at value, i
+        if [c lt 128 or c ge 192] [ length = length add 1 ]
+        i = i add 1
+    ]
+    if [item.bounds eq 1 and [length lt item.lower or length gt item.upper]] [ = bad_definition [] ]
+    = choice item, label, json.quote value
+]
+
+pub fn integer_choice [Definition item, str label, int value] Definition [
+    if [not item.ok or [item.kind ne 4 and item.kind ne 10]] [ = bad_definition [] ]
+    if [item.bounds eq 2 and [value lt item.lower or value gt item.upper]] [ = bad_definition [] ]
+    = choice item, label, int.str value
+]
+
+fn duplicate [Definitions list, str name] bool [
+    int i = 0
+    while [i lt list.count] [
+        json.Text item = json.element list.value, i
+        json.Text raw = json.member item.value, 'name'
+        json.Text previous = json.text raw.value
+        if [str.eq previous.value, name] [ = true ]
+        i = i add 1
+    ]
+    = false
+]
+
+fn append [Definitions list, Definition item] Definitions [
+    str encoded = render item
+    # Keep serialized sets below the native transport's 64 KiB request cap.
+    if [str.len list.value add str.len encoded add 1 gt 60000] [ = bad_list [] ]
+    list.value = str.slice list.value, 0, [str.len list.value sub 1]
+    if [list.count gt 0] [ list.value = str.concat list.value, ',' ]
+    list.value = str.concat list.value, encoded
+    list.value = str.concat list.value, ']'
+    list.count = list.count add 1
+    = list
+]
+
+pub fn add_option [Definitions list, Definition item] Definitions [
+    if [not list.ok or not item.ok or list.role ne 0 or list.count ge 25 or item.scope eq 3 or duplicate list, item.name] [ = bad_list [] ]
+    int mode = 1
+    if [item.scope ne 0] [ mode = 2 ]
+    if [list.mode ne 0 and list.mode ne mode] [ = bad_list [] ]
+    if [item.scope eq 0] [
+        if [item.required and list.optional_seen] [ = bad_list [] ]
+        if [not item.required] [ list.optional_seen = true ]
+    ]
+    list.mode = mode
+    = append list, item
+]
+
+fn branch [int kind, str name, str description, Definitions children] Definition [
+    if [not name_valid name or not description_valid description or not children.ok or children.role ne 0] [ = bad_definition [] ]
+    if [kind eq 1 and children.mode eq 2] [ = bad_definition [] ]
+    if [kind eq 2] [
+        if [children.count eq 0 or children.mode ne 2] [ = bad_definition [] ]
+        int i = 0
+        while [i lt children.count] [
+            json.Text item = json.element children.value, i
+            json.Text child_kind = json.member item.value, 'type'
+            if [not str.eq child_kind.value, '1'] [ = bad_definition [] ]
+            i = i add 1
+        ]
+    ]
+    str value = base kind, name, description
+    value = str.concat value, ',"options":'
+    value = str.concat value, children.value
+    value = str.concat value, '}'
+    if [str.len value gt 60000] [ = bad_definition [] ]
+    = Definition [true, '', kind, false, name, value, kind, 0, 0, 0, '[]', 0]
+]
+
+pub fn subcommand [str name, str description, Definitions options] Definition [
+    = branch 1, name, description, options
+]
+
+pub fn command_group [str name, str description, Definitions subcommands] Definition [
+    = branch 2, name, description, subcommands
+]
+
+pub fn slash_command [str name, str description, Definitions options] Definition [
+    if [not name_valid name or not description_valid description or not options.ok or options.role ne 0] [ = bad_definition [] ]
+    str value = base 1, name, description
+    value = str.concat value, ',"options":'
+    value = str.concat value, options.value
+    value = str.concat value, '}'
+    if [str.len value gt 60000] [ = bad_definition [] ]
+    = Definition [true, '', 3, false, name, value, 1, 0, 0, 0, '[]', 0]
+]
+
+pub fn add_command [Definitions list, Definition item] Definitions [
+    if [not list.ok or not item.ok or list.role ne 1 or list.count ge 100 or item.scope ne 3 or duplicate list, item.name] [ = bad_list [] ]
+    = append list, item
+]
+
+pub fn definition_json [Definition item] json.Text [
+    if [not item.ok] [ = json.Text [false, ''] ]
+    = json.Text [true, render item]
+]
+
+# Internal bridge: a subcommand is not a standalone slash-command schema.
+pub fn slash_schema [Definition item] json.Text [
+    if [not item.ok or item.scope ne 3 or item.kind ne 1] [ = json.Text [false, ''] ]
+    = json.Text [true, render item]
+]
+
+pub fn definitions_json [Definitions list] json.Text [
+    if [not list.ok] [ = json.Text [false, ''] ]
+    = json.Text [true, list.value]
+]
+
+# Bulk replacement remains explicit. Even an empty valid list removes all commands.
+pub fn guild_command_set [str application_id, str guild_id, Definitions commands] rest.Request [
+    if [not commands.ok or commands.role ne 1] [ = rest.Request [false, '', '', ''] ]
+    = rest.guild_commands application_id, guild_id, commands.value
+]
+
+pub fn global_command_set [str application_id, Definitions commands] rest.Request [
+    if [not commands.ok or commands.role ne 1] [ = rest.Request [false, '', '', ''] ]
+    = rest.global_commands application_id, commands.value
+]

@@ -1,0 +1,157 @@
+use './rest.zn' as rest
+
+# Canonical decimal uint64 IDs are split into 7/7/6-digit chunks. No strings,
+# tokens or controller pointers are retained; each occupied slot is fixed-size.
+struct Receipt [
+    int app0
+    int app1
+    int app2
+    int id0
+    int id1
+    int id2
+    int remaining
+    bool occupied
+]
+
+pub struct ReceiptStore [
+    ptr Receipt slots
+    int capacity
+    int size
+    int clock
+    bool initialized
+    bool failed
+    str error
+]
+
+pub fn new_receipts [int capacity] ptr ReceiptStore [
+    if [capacity lt 1 or capacity gt 4096] [ = null ]
+    ptr ReceiptStore store = sys.alloc 1
+    if [not store] [ = null ]
+    ptr Receipt slots = sys.alloc capacity
+    if [not slots] [ sys.free store
+        = null
+    ]
+    store[0] = ReceiptStore [slots, capacity, 0, 0, false, false, '']
+    = store
+]
+
+pub fn close_receipts [ptr ReceiptStore store] int [
+    if [store] [
+        sys.free store[0].slots
+        sys.free store
+    ]
+    = 0
+]
+
+pub fn receipt_error [ptr ReceiptStore store] str [
+    if [not store] [ = 'receipt store allocation failed' ]
+    = store[0].error
+]
+
+pub fn receipt_count [ptr ReceiptStore store] int [
+    if [not store] [ = 0 ]
+    ptr Receipt slots = store[0].slots
+    int i = 0
+    int count = 0
+    while [i lt store[0].size] [
+        if [slots[i].occupied] [ count = count add 1 ]
+        i = i add 1
+    ]
+    = count
+]
+
+pub fn advance_receipts [ptr ReceiptStore store, int now] bool [
+    if [not store or store[0].failed] [ = false ]
+    if [now lt 0 or now ge 1000000000] [
+        store[0].error = 'invalid receipt clock'
+        store[0].failed = true
+        = false
+    ]
+    if [not store[0].initialized] [
+        store[0].clock = now
+        store[0].initialized = true
+        = true
+    ]
+    int delta = now sub store[0].clock
+    if [delta lt 0] [ delta = delta add 1000000000 ]
+    # Reject clock rollback/ambiguous long gaps instead of clearing live claims.
+    # The connected client advances this clock during normal polling and REST.
+    if [delta ge 500000000] [
+        store[0].error = 'receipt clock moved backwards or was not serviced'
+        store[0].failed = true
+        = false
+    ]
+    if [delta eq 0] [ = true ]
+    store[0].clock = now
+    ptr Receipt slots = store[0].slots
+    int i = 0
+    while [i lt store[0].size] [
+        if [slots[i].occupied] [
+            if [delta ge slots[i].remaining] [
+                slots[i] = Receipt [0, 0, 0, 0, 0, 0, 0, false]
+            ]
+            else [ slots[i].remaining = slots[i].remaining sub delta ]
+        ]
+        i = i add 1
+    ]
+    = true
+]
+
+fn chunk [str id, int part] int [
+    int end = str.len id sub [part mul 7]
+    if [end le 0] [ = 0 ]
+    int start = end sub 7
+    if [start lt 0] [ start = 0 ]
+    int value = 0
+    while [start lt end] [
+        int digit = str.at id, start
+        value = value mul 10 add [digit sub 48]
+        start = start add 1
+    ]
+    = value
+]
+
+fn same [Receipt a, Receipt b] bool [
+    = a.app0 eq b.app0 and a.app1 eq b.app1 and a.app2 eq b.app2 and a.id0 eq b.id0 and a.id1 eq b.id1 and a.id2 eq b.id2
+]
+
+pub fn claim_receipt [ptr ReceiptStore store, str application_id, str interaction_id, int now] bool [
+    if [not store or store[0].failed] [ = false ]
+    if [not rest.snowflake application_id or not rest.snowflake interaction_id] [
+        store[0].error = 'invalid interaction receipt ID'
+        = false
+    ]
+    if [not advance_receipts store, now] [ = false ]
+    Receipt candidate = Receipt [0, 0, 0, 0, 0, 0, 900000, true]
+    candidate.app0 = chunk application_id, 0
+    candidate.app1 = chunk application_id, 1
+    candidate.app2 = chunk application_id, 2
+    candidate.id0 = chunk interaction_id, 0
+    candidate.id1 = chunk interaction_id, 1
+    candidate.id2 = chunk interaction_id, 2
+    ptr Receipt slots = store[0].slots
+    int free_slot = 0 sub 1
+    int i = 0
+    while [i lt store[0].size] [
+        if [slots[i].occupied] [
+            if [same slots[i], candidate] [
+                # A replay never refreshes retention or erases the owner claim.
+                store[0].error = 'interaction was already claimed by this client'
+                = false
+            ]
+        ]
+        else [ if [free_slot lt 0] [ free_slot = i ] ]
+        i = i add 1
+    ]
+    if [free_slot lt 0] [
+        if [store[0].size ge store[0].capacity] [
+            store[0].error = 'interaction receipt capacity reached; live claims retained'
+            = false
+        ]
+        free_slot = store[0].size
+        store[0].size = free_slot add 1
+    ]
+    slots[free_slot] = candidate
+    store[0].error = ''
+    = true
+]

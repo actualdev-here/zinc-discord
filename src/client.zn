@@ -1,0 +1,614 @@
+use 'zinc-json' as json
+use 'zinc-net' as wire
+use './gateway.zn' as gw
+use './rest.zn' as rest
+use './receipts.zn' as receipts
+
+pub struct Response [
+    pub bool ok
+    pub int status
+    pub str body
+    pub str error
+    pub int retry_ms
+]
+
+pub struct Event [
+    pub bool ok
+    pub str name
+    pub str data
+    pub str error
+    pub int received_ms
+]
+
+pub struct Execution [
+    pub Response response
+    pub bool dispatched
+]
+
+struct Bucket [
+    str key
+    str major
+    str server_id
+    int wait_ms
+]
+
+pub struct Client [
+    str token
+    str base
+    bool test_mode
+    gw.Gateway gateway
+    str gateway_url
+    int socket
+    int clock
+    int gateway_clock
+    int global_wait
+    int reconnect_wait
+    int identify_wait
+    int remaining_sessions
+    int session_reset
+    int attempts
+    int send_count
+    int send_window
+    bool started
+    bool failed
+    str error
+    ptr Bucket buckets
+    int bucket_count
+    ptr Event events
+    int event_head
+    int event_count
+    bool dispatched
+    ptr receipts.ReceiptStore receipts
+]
+
+fn text_field [str source, str key] str [
+    json.Text raw = json.member source, key
+    json.Text value = json.text raw.value
+    = value.value
+]
+
+fn int_field [str source, str key] int [
+    json.Text raw = json.member source, key
+    json.Integer value = json.unsigned_int raw.value
+    if [not value.ok] [ = 0 sub 1 ]
+    = value.value
+]
+
+fn fail_client [ptr Client client, str message] int [
+    client[0].failed = true
+    client[0].error = message
+    if [client[0].socket gt 0] [ wire.ws_close client[0].socket ]
+    client[0].socket = 0
+    = 0
+]
+
+fn make_client [str token, int intents, str base, bool test_mode, int receipt_capacity] ptr Client [
+    if [receipt_capacity lt 1 or receipt_capacity gt 4096] [ = null ]
+    ptr Client client = sys.alloc 1
+    if [not client] [ = null ]
+    ptr Bucket buckets = sys.alloc 128
+    ptr Event events = sys.alloc 64
+    ptr receipts.ReceiptStore claims = receipts.new_receipts receipt_capacity
+    if [not buckets or not events or not claims] [
+        if [buckets] [ sys.free buckets ]
+        if [events] [ sys.free events ]
+        receipts.close_receipts claims
+        sys.free client
+        = null
+    ]
+    gw.Gateway state = gw.new_gateway token, intents
+    client[0] = Client [token, base, test_mode, state, '', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60000, false, false, '', buckets, 0, events, 0, 0, false, claims]
+    json.Integer clock = wire.clock_ms []
+    if [not clock.ok or str.eq state.action, 'fatal'] [
+        fail_client client, 'invalid bot token/intents or clock unavailable'
+        = client
+    ]
+    client[0].clock = clock.value
+    client[0].gateway_clock = clock.value
+    = client
+]
+
+pub fn new_client [str bot_token, int intents] ptr Client [
+    = make_client bot_token, intents, [rest.api_base []], false, 1024
+]
+
+pub fn new_client_with_receipts [str bot_token, int intents, int capacity] ptr Client [
+    = make_client bot_token, intents, [rest.api_base []], false, capacity
+]
+
+# Dedicated fake-server entry: cannot accept ordinary real Discord tokens.
+pub fn new_test_client [str token, int intents, str base] ptr Client [
+    ptr Client client = make_client token, intents, base, true, 1024
+    if [not client] [ = null ]
+    if [not str.starts token, 'test.' or not str.starts base, 'https://localhost:'] [
+        fail_client client, 'test client requires test.* token and HTTPS localhost origin'
+    ]
+    = client
+]
+
+pub fn client_error [ptr Client client] str [
+    if [not client] [ = 'client allocation failed' ]
+    = client[0].error
+]
+
+pub fn close_client [ptr Client client] int [
+    if [not client] [ = 0 ]
+    if [client[0].socket gt 0] [ wire.ws_close client[0].socket ]
+    receipts.close_receipts client[0].receipts
+    sys.free client[0].buckets
+    sys.free client[0].events
+    sys.free client
+    = 0
+]
+
+fn reduce [int value, int elapsed] int [
+    if [elapsed ge value] [ = 0 ]
+    = value sub elapsed
+]
+
+fn advance_clock [ptr Client client] int [
+    json.Integer clock = wire.clock_ms []
+    if [not clock.ok] [ = fail_client client, 'monotonic clock failed' ]
+    if [not receipts.advance_receipts client[0].receipts, clock.value] [ = fail_client client, 'interaction receipt clock failed' ]
+    int delta = wire.elapsed client[0].clock, clock.value
+    client[0].clock = clock.value
+    client[0].global_wait = reduce client[0].global_wait, delta
+    client[0].reconnect_wait = reduce client[0].reconnect_wait, delta
+    client[0].identify_wait = reduce client[0].identify_wait, delta
+    client[0].session_reset = reduce client[0].session_reset, delta
+    client[0].send_window = reduce client[0].send_window, delta
+    if [client[0].send_window eq 0] [
+        client[0].send_count = 0
+        client[0].send_window = 60000
+    ]
+    ptr Bucket buckets = client[0].buckets
+    int i = 0
+    while [i lt client[0].bucket_count] [
+        buckets[i].wait_ms = reduce buckets[i].wait_ms, delta
+        i = i add 1
+    ]
+    = 1
+]
+
+# Internal controller bridge. Do not expose the store or permit clearing claims.
+pub fn claim_interaction [ptr Client client, str application_id, str interaction_id] bool [
+    if [not client or client[0].failed] [ = false ]
+    if [not advance_clock client] [ = false ]
+    = receipts.claim_receipt client[0].receipts, application_id, interaction_id, client[0].clock
+]
+
+pub fn interaction_claim_error [ptr Client client] str [
+    if [not client] [ = 'client allocation failed' ]
+    if [client[0].failed] [ = client[0].error ]
+    = receipts.receipt_error client[0].receipts
+]
+
+fn gateway_url_valid [ptr Client client, str url] bool [
+    if [client[0].test_mode] [ = str.starts url, 'wss://localhost:' ]
+    if [not str.starts url, 'wss://'] [ = false ]
+    int end = 6
+    while [end lt str.len url] [
+        int c = str.at url, end
+        if [c eq 47 or c eq 63] [ break ]
+        if [c ne 45 and c ne 46 and [c lt 97 or c gt 122] and [c lt 48 or c gt 57]] [ = false ]
+        end = end add 1
+    ]
+    str host = str.slice url, 6, end
+    if [str.eq host, 'gateway.discord.gg'] [ = true ]
+    int n = str.len host
+    if [n lt 20 or not str.starts host, 'gateway-'] [ = false ]
+    str suffix = str.slice host, [n sub 11], n
+    = str.eq suffix, '.discord.gg'
+]
+
+fn discover [ptr Client client] int [
+    str url = str.concat client[0].base, '/gateway/bot'
+    str auth = str.concat 'Bot ', client[0].token
+    wire.Response response = wire.http url, 'GET', auth, ''
+    if [not response.ok or response.status ne 200] [ = fail_client client, 'Gateway discovery failed' ]
+    str gateway_url = text_field response.body, 'url'
+    if [not gateway_url_valid client, gateway_url] [ = fail_client client, 'untrusted Gateway origin' ]
+    int shards = int_field response.body, 'shards'
+    if [shards ne 1] [ = fail_client client, 'this client supports one shard; sharded bots require a shard manager' ]
+    json.Text raw = json.member response.body, 'session_start_limit'
+    int remaining = int_field raw.value, 'remaining'
+    int reset = int_field raw.value, 'reset_after'
+    int concurrency = int_field raw.value, 'max_concurrency'
+    if [remaining lt 0 or reset lt 0 or reset gt 86400000 or concurrency lt 1] [
+        = fail_client client, 'invalid Gateway session-start limits'
+    ]
+    client[0].gateway_url = gateway_url
+    client[0].remaining_sessions = remaining
+    client[0].session_reset = reset
+    = 1
+]
+
+fn schedule_reconnect [ptr Client client, int minimum] int [
+    if [client[0].socket gt 0] [ wire.ws_close client[0].socket ]
+    client[0].socket = 0
+    client[0].attempts = client[0].attempts add 1
+    if [client[0].attempts gt 5] [ = fail_client client, 'Gateway reconnect budget exhausted' ]
+    int delay = 1000
+    int i = 1
+    while [i lt client[0].attempts] [ delay = delay mul 2
+        i = i add 1
+    ]
+    json.Integer jitter = wire.random 1001
+    if [not jitter.ok] [ = fail_client client, 'secure random source failed' ]
+    delay = delay add jitter.value
+    if [minimum gt delay] [ delay = minimum ]
+    client[0].reconnect_wait = delay
+    = 1
+]
+
+fn open_gateway [ptr Client client] int [
+    if [client[0].reconnect_wait gt 0] [ = 1 ]
+    if [not wire.websocket_supported []] [ = fail_client client, 'installed libcurl lacks WebSocket/WSS support' ]
+    if [str.len client[0].gateway_url eq 0] [
+        if [client[0].global_wait gt 0] [ = 1 ]
+        if [not discover client] [ = 0 ]
+    ]
+    gw.Gateway state = client[0].gateway
+    if [str.len state.session_id eq 0] [
+        if [client[0].identify_wait gt 0] [ = 1 ]
+        if [client[0].remaining_sessions eq 0] [
+            if [client[0].session_reset gt 0] [ = 1 ]
+            if [client[0].global_wait gt 0] [ = 1 ]
+            if [not discover client] [ = 0 ]
+            if [client[0].remaining_sessions eq 0] [ = fail_client client, 'Gateway session-start budget unavailable' ]
+        ]
+    ]
+    str url = client[0].gateway_url
+    if [str.len state.session_id gt 0 and str.len state.resume_url gt 0] [ url = state.resume_url ]
+    if [not gateway_url_valid client, url] [ = fail_client client, 'untrusted Gateway resume origin' ]
+    # Discovery/resume URLs are base URLs. Reject pre-existing query to avoid ambiguity.
+    int i = 0
+    while [i lt str.len url] [
+        if [str.at url, i eq 63] [ = fail_client client, 'Gateway URL must not contain a query' ]
+        i = i add 1
+    ]
+    url = str.concat url, '?v=10&encoding=json'
+    json.Integer opened = wire.ws_open url
+    if [not opened.ok] [ = schedule_reconnect client, 1000 ]
+    client[0].socket = opened.value
+    client[0].gateway = gw.connected state
+    advance_clock client
+    client[0].gateway_clock = client[0].clock
+    = 1
+]
+
+fn handle_action [ptr Client client] int [
+    gw.Gateway state = client[0].gateway
+    if [str.eq state.action, 'fatal'] [ = fail_client client, 'Gateway rejected credentials, shard or intents' ]
+    if [str.eq state.action, 'reconnect'] [ = schedule_reconnect client, state.retry_ms ]
+    if [str.eq state.action, 'send'] [
+        if [client[0].send_count ge 110] [ = schedule_reconnect client, 60000 ]
+        json.Text opcode = json.member state.payload, 'op'
+        if [str.eq opcode.value, '2'] [
+            if [client[0].identify_wait gt 0 or client[0].remaining_sessions le 0] [ = schedule_reconnect client, 5000 ]
+            client[0].identify_wait = 5000
+            client[0].remaining_sessions = client[0].remaining_sessions sub 1
+        ]
+        if [not wire.ws_send client[0].socket, state.payload] [ = schedule_reconnect client, 1000 ]
+        client[0].send_count = client[0].send_count add 1
+    ]
+    if [str.eq state.action, 'event'] [
+        if [str.eq state.event, 'READY' and not gateway_url_valid client, state.resume_url] [
+            = fail_client client, 'untrusted Gateway resume origin'
+        ]
+        if [str.eq state.event, 'READY' or str.eq state.event, 'RESUMED'] [ client[0].attempts = 0 ]
+        if [client[0].event_count ge 64] [ = fail_client client, 'Gateway event queue full; consume events faster' ]
+        ptr Event events = client[0].events
+        int index = client[0].event_head add client[0].event_count
+        index = index mod 64
+        json.Integer received = wire.clock_ms []
+        if [not received.ok] [ = fail_client client, 'event receipt clock failed' ]
+        events[index] = Event [true, state.event, state.data, '', received.value]
+        client[0].event_count = client[0].event_count add 1
+    ]
+    state.action = 'none'
+    state.payload = ''
+    state.event = ''
+    state.data = ''
+    client[0].gateway = state
+    = 1
+]
+
+fn pump [ptr Client client, int timeout_ms] int [
+    if [client[0].failed or not advance_clock client] [ = 0 ]
+    if [client[0].socket eq 0] [
+        if [not open_gateway client] [ = 0 ]
+        if [client[0].socket eq 0] [ wire.sleep_ms timeout_ms
+            = advance_clock client
+        ]
+    ]
+    int elapsed = wire.elapsed client[0].gateway_clock, client[0].clock
+    client[0].gateway_clock = client[0].clock
+    client[0].gateway = gw.tick client[0].gateway, elapsed
+    if [not handle_action client or client[0].socket eq 0] [ = not client[0].failed ]
+    wire.Frame frame = wire.ws_receive client[0].socket, timeout_ms
+    if [not frame.ok] [ = schedule_reconnect client, 1000 ]
+    if [str.eq frame.kind, 'close'] [
+        client[0].socket = 0
+        client[0].gateway = gw.disconnected client[0].gateway, frame.code
+        = handle_action client
+    ]
+    if [str.eq frame.kind, 'text'] [
+        json.Integer random = wire.random 1001
+        if [not random.ok] [ = fail_client client, 'secure random source failed' ]
+        client[0].gateway = gw.receive client[0].gateway, frame.data, random.value
+        = handle_action client
+    ]
+    = 1
+]
+
+pub fn next_event [ptr Client client, int timeout_ms] Event [
+    if [not client] [ = Event [false, '', '', 'client allocation failed', 0] ]
+    if [timeout_ms lt 0 or timeout_ms gt 60000] [ = Event [false, '', '', 'event timeout must be 0..60000ms', 0] ]
+    client[0].started = true
+    if [not advance_clock client] [ = Event [false, '', '', client[0].error, 0] ]
+    # Even a nonempty queue must not starve Gateway heartbeats while being drained.
+    if [client[0].event_count gt 0] [ pump client, 0 ]
+    int start = client[0].clock
+    int elapsed = 0
+    while [client[0].event_count eq 0 and not client[0].failed] [
+        int step = timeout_ms sub elapsed
+        if [step gt 100] [ step = 100 ]
+        if [step lt 0] [ step = 0 ]
+        if [not pump client, step] [ break ]
+        advance_clock client
+        elapsed = wire.elapsed start, client[0].clock
+        if [elapsed ge timeout_ms] [ break ]
+    ]
+    if [client[0].failed] [ = Event [false, '', '', client[0].error, 0] ]
+    if [client[0].event_count eq 0] [ = Event [true, '', '', '', 0] ]
+    ptr Event events = client[0].events
+    int head = client[0].event_head
+    Event event = events[head]
+    client[0].event_head = [head add 1] mod 64
+    client[0].event_count = client[0].event_count sub 1
+    = event
+]
+
+fn valid_route [str route] bool [
+    int n = str.len route
+    if [n lt 1 or n gt 2048 or str.at route, 0 ne 47] [ = false ]
+    int i = 0
+    bool query = false
+    while [i lt n] [
+        int c = str.at route, i
+        if [c eq 63 and not query] [
+            if [i eq n sub 1] [ = false ]
+            query = true
+            i = i add 1
+            continue
+        ]
+        if [query] [
+            if [c ge 97 and c le 122 or c ge 65 and c le 90 or c ge 48 and c le 57 or c eq 38 or c eq 61 or c eq 95 or c eq 45] [
+                i = i add 1
+                continue
+            ]
+            = false
+        ]
+        if [c eq 46] [
+            int start = i
+            while [i lt n and str.at route, i eq 46] [ i = i add 1 ]
+            if [start eq 0 or str.at route, [start sub 1] eq 47] [
+                if [i eq n or str.at route, i eq 47 or str.at route, i eq 63] [ = false ]
+            ]
+            continue
+        ]
+        if [c ge 97 and c le 122 or c ge 65 and c le 90 or c ge 48 and c le 57 or c eq 47 or c eq 64 or c eq 95 or c eq 45] [ i = i add 1 ]
+        else [ = false ]
+    ]
+    = true
+]
+
+fn route_path [str route] str [
+    int i = 0
+    while [i lt str.len route] [
+        if [str.at route, i eq 63] [ = str.slice route, 0, i ]
+        i = i add 1
+    ]
+    = route
+]
+
+fn route_key [str method, str route] str [
+    route = route_path route
+    str key = str.concat method, ':'
+    str previous = ''
+    int start = 1
+    int i = 1
+    int segment = 0
+    bool interaction = str.starts route, '/interactions/'
+    bool webhook = str.starts route, '/webhooks/'
+    while [i le str.len route] [
+        if [i eq str.len route or str.at route, i eq 47] [
+            str part = str.slice route, start, i
+            key = str.concat key, '/'
+            if [[interaction or webhook] and segment eq 2] [ key = str.concat key, ':token' ]
+            else [ if [rest.snowflake part and not str.eq previous, 'channels' and not str.eq previous, 'guilds' and not str.eq previous, 'webhooks'] [
+                key = str.concat key, ':id'
+            ]
+            else [ key = str.concat key, part ]
+            ]
+            previous = part
+            segment = segment add 1
+            start = i add 1
+        ]
+        i = i add 1
+    ]
+    = key
+]
+
+fn route_major [str route] str [
+    route = route_path route
+    # Current helpers use channel/guild/application routes. Keep major IDs separate.
+    str major = ''
+    str previous = ''
+    int start = 1
+    int i = 1
+    while [i le str.len route] [
+        if [i eq str.len route or str.at route, i eq 47] [
+            str part = str.slice route, start, i
+            if [str.eq previous, 'channels' or str.eq previous, 'guilds' or str.eq previous, 'webhooks'] [
+                major = str.concat major, '/'
+                major = str.concat major, part
+            ]
+            previous = part
+            start = i add 1
+        ]
+        i = i add 1
+    ]
+    = major
+]
+
+fn get_bucket [ptr Client client, rest.Request request] int [
+    str key = route_key request.method, request.route
+    ptr Bucket buckets = client[0].buckets
+    int i = 0
+    while [i lt client[0].bucket_count] [
+        if [str.eq buckets[i].key, key] [ = i ]
+        i = i add 1
+    ]
+    if [i ge 128] [ = 0 sub 1 ]
+    str major = route_major request.route
+    buckets[i] = Bucket [key, major, '', 0]
+    client[0].bucket_count = i add 1
+    = i
+]
+
+fn wait_limits [ptr Client client, int bucket, int started, int budget] int [
+    ptr Bucket buckets = client[0].buckets
+    while [true] [
+        if [not advance_clock client or client[0].failed] [ = 0 ]
+        int wait = client[0].global_wait
+        if [buckets[bucket].wait_ms gt wait] [ wait = buckets[bucket].wait_ms ]
+        if [budget gt 0] [
+            int remaining = budget sub wire.elapsed started, client[0].clock
+            if [remaining le 0 or wait ge remaining] [ = 0 ]
+        ]
+        if [wait eq 0] [ = 1 ]
+        if [wait gt 100] [ wait = 100 ]
+        if [client[0].started] [ if [not pump client, wait] [ = 0 ] ]
+        else [ if [not wire.sleep_ms wait] [ = fail_client client, 'rate-limit wait failed' ] ]
+    ]
+    = 0
+]
+
+fn share_bucket [ptr Client client, int index, str server_id, int delay] int [
+    ptr Bucket buckets = client[0].buckets
+    if [str.len server_id gt 0] [ buckets[index].server_id = server_id ]
+    if [buckets[index].wait_ms gt delay] [ delay = buckets[index].wait_ms ]
+    int i = 0
+    while [i lt client[0].bucket_count] [
+        if [str.len server_id gt 0 and str.eq buckets[i].server_id, server_id and str.eq buckets[i].major, buckets[index].major] [
+            if [buckets[i].wait_ms gt delay] [ delay = buckets[i].wait_ms ]
+        ]
+        i = i add 1
+    ]
+    buckets[index].wait_ms = delay
+    i = 0
+    while [i lt client[0].bucket_count] [
+        if [str.len server_id gt 0 and str.eq buckets[i].server_id, server_id and str.eq buckets[i].major, buckets[index].major] [ buckets[i].wait_ms = delay ]
+        i = i add 1
+    ]
+    = 1
+]
+
+fn execute_inner [ptr Client client, rest.Request request, int budget] Response [
+    if [not client] [ = Response [false, 0, '', 'client allocation failed', 0] ]
+    client[0].dispatched = false
+    if [client[0].failed] [ = Response [false, 0, '', client[0].error, 0] ]
+    if [not request.ok or not valid_route request.route] [ = Response [false, 0, '', 'invalid Discord request', 0] ]
+    int bucket = get_bucket client, request
+    if [bucket lt 0] [ = Response [false, 0, '', 'REST route capacity reached', 0] ]
+    int retries = 0
+    if [not advance_clock client] [ = Response [false, 0, '', client[0].error, 0] ]
+    int started = client[0].clock
+    int last_status = 0
+    str last_body = ''
+    while [true] [
+        if [not wait_limits client, bucket, started, budget] [
+            if [client[0].failed] [ = Response [false, last_status, last_body, client[0].error, 0] ]
+            ptr Bucket waiting = client[0].buckets
+            int blocked_retry = waiting[bucket].wait_ms
+            if [client[0].global_wait gt blocked_retry] [ blocked_retry = client[0].global_wait ]
+            = Response [false, last_status, last_body, 'REST budget exhausted before dispatch', blocked_retry]
+        ]
+        str url = str.concat client[0].base, request.route
+        str auth = ''
+        if [not str.starts request.route, '/interactions/' and not str.starts request.route, '/webhooks/'] [ auth = str.concat 'Bot ', client[0].token ]
+        int remaining = 15000
+        if [budget gt 0] [ remaining = budget sub wire.elapsed started, client[0].clock ]
+        if [remaining le 0] [ = Response [false, last_status, last_body, 'REST budget exhausted before dispatch', 0] ]
+        json.Integer transfer = wire.http_start_timed url, request.method, auth, request.body, remaining
+        if [not transfer.ok] [ = Response [false, 0, '', 'HTTP transfer could not start', 0] ]
+        client[0].dispatched = true
+        wire.Transfer pending = wire.http_poll transfer.value
+        while [not pending.ready] [
+            if [client[0].started and not client[0].failed] [
+                # Preserve an in-flight HTTP outcome even if Gateway fails meanwhile.
+                # A possibly-applied POST must not be reported as safely cancelled.
+                pump client, 20
+            ]
+            else [ wire.sleep_ms 10 ]
+            pending = wire.http_poll transfer.value
+        ]
+        wire.Response response = pending.response
+        if [not response.ok] [ = Response [false, 0, '', response.error, 0] ]
+        advance_clock client
+        int delay = 0
+        if [response.remaining eq 0] [
+            if [response.reset_ms lt 0 and response.status ne 429] [
+                fail_client client, 'exhausted REST bucket without reset delay'
+                = Response [false, response.status, response.body, client[0].error, 0]
+            ]
+            delay = response.reset_ms
+        ]
+        if [response.status eq 429] [
+            last_status = 429
+            last_body = response.body
+            int retry = response.retry_ms
+            json.Text raw_retry = json.member response.body, 'retry_after'
+            json.Integer parsed_retry = wire.seconds_ms raw_retry.value
+            if [parsed_retry.ok and parsed_retry.value gt retry] [ retry = parsed_retry.value ]
+            if [retry lt 1 or retry gt 86400000] [
+                fail_client client, '429 without a valid retry delay; refusing to retry'
+                = Response [false, 429, response.body, client[0].error, 0]
+            ]
+            if [retry gt delay] [ delay = retry ]
+            json.Text global = json.member response.body, 'global'
+            if [[str.eq global.value, 'true' or response.global] and delay gt client[0].global_wait] [ client[0].global_wait = delay ]
+            share_bucket client, bucket, response.bucket, delay
+            retries = retries add 1
+            if [retries gt 3 or delay gt 60000] [ = Response [false, 429, response.body, 'REST retry budget exceeded; wait before retrying', delay] ]
+            if [client[0].failed] [ = Response [false, 429, response.body, client[0].error, delay] ]
+            continue
+        ]
+        share_bucket client, bucket, response.bucket, delay
+        if [response.status eq 401 and str.len auth gt 0] [ fail_client client, 'Discord authentication failed' ]
+        if [response.status lt 200 or response.status ge 300] [
+            = Response [false, response.status, response.body, 'Discord HTTP error (not automatically replayed)', delay]
+        ]
+        = Response [true, response.status, response.body, '', delay]
+    ]
+    = Response [false, 0, '', 'unreachable REST state', 0]
+]
+
+pub fn execute [ptr Client client, rest.Request request] Response [
+    = execute_inner client, request, 0
+]
+
+# Single-threaded client: dispatched conservatively means a worker was started,
+# not proof the peer received the request. Preserve this for ambiguous failures.
+pub fn execute_for [ptr Client client, rest.Request request, int budget_ms] Execution [
+    if [budget_ms lt 1 or budget_ms gt 15000] [
+        Response invalid = Response [false, 0, '', 'REST budget must be 1..15000ms', 0]
+        = Execution [invalid, false]
+    ]
+    Response response = execute_inner client, request, budget_ms
+    bool dispatched = false
+    if [client] [ dispatched = client[0].dispatched ]
+    = Execution [response, dispatched]
+]

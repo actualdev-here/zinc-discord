@@ -1,0 +1,175 @@
+use 'zinc-json' as json
+use './models.zn' as models
+use './commands.zn' as commands
+use './validation.zn' as validation
+use './policy.zn' as policy
+use './cooldowns.zn' as cooldowns
+
+struct Route [
+    int kind
+    str path
+    int handler
+    bool checked
+    str schema
+    policy.CommandPolicy checks
+]
+pub struct Router [
+    ptr Route routes
+    int count
+    ptr cooldowns.CooldownStore cooldowns
+]
+pub struct RouteMatch [
+    pub bool ok
+    pub str error
+    pub int handler
+    pub str path
+    pub str options
+    pub str code
+    pub str parameter
+    pub int retry_ms
+]
+
+pub fn new_router [] ptr Router [
+    = new_router_with_cooldowns 1024
+]
+
+pub fn new_router_with_cooldowns [int capacity] ptr Router [
+    ptr Router router = sys.alloc 1
+    if [not router] [ = null ]
+    ptr Route routes = sys.alloc 128
+    ptr cooldowns.CooldownStore store = cooldowns.new_cooldowns capacity
+    if [not routes or not store] [
+        if [routes] [ sys.free routes ]
+        cooldowns.close_cooldowns store
+        sys.free router
+        = null
+    ]
+    router[0] = Router [routes, 0, store]
+    = router
+]
+
+pub fn close_router [ptr Router router] int [
+    if [router] [ sys.free router[0].routes
+        cooldowns.close_cooldowns router[0].cooldowns
+        sys.free router
+    ]
+    = 0
+]
+
+fn path_valid [int kind, str path] bool [
+    int n = str.len path
+    if [n lt 1 or n gt 100 or not json.valid json.quote path] [ = false ]
+    if [kind ne 1] [ = kind eq 2 or kind eq 3 ]
+    int i = 0
+    int width = 0
+    int segments = 1
+    while [i lt n] [
+        int c = str.at path, i
+        if [c eq 32] [
+            if [width eq 0] [ = false ]
+            width = 0
+            segments = segments add 1
+            if [segments gt 3] [ = false ]
+        ]
+        else [
+            if [[c lt 97 or c gt 122] and [c lt 48 or c gt 57] and c ne 45 and c ne 95] [ = false ]
+            width = width add 1
+            if [width gt 32] [ = false ]
+        ]
+        i = i add 1
+    ]
+    = width gt 0
+]
+
+pub fn add_route [ptr Router router, int command_type, str path, int handler] bool [
+    if [not router or router[0].count ge 128 or handler lt 0 or not path_valid command_type, path] [ = false ]
+    ptr Route routes = router[0].routes
+    int i = 0
+    while [i lt router[0].count] [
+        if [routes[i].kind eq command_type and str.eq routes[i].path, path] [ = false ]
+        i = i add 1
+    ]
+    routes[i] = Route [command_type, path, handler, false, '[]', policy.new_policy []]
+    router[0].count = i add 1
+    = true
+]
+
+# Reuses the registration builder; no parallel hand-written argument schema.
+# Registration is atomic: failed definition/path checks never consume a slot.
+pub fn add_defined_route [ptr Router router, commands.Definition definition, str path, int handler] bool [
+    = add_policy_route router, definition, path, handler, policy.new_policy []
+]
+
+pub fn add_policy_route [ptr Router router, commands.Definition definition, str path, int handler, policy.CommandPolicy checks] bool [
+    if [not policy.valid_policy checks or not path_valid 1, path] [ = false ]
+    json.Text schema = validation.route_schema definition, path
+    if [not schema.ok or not add_route router, 1, path, handler] [ = false ]
+    ptr Route routes = router[0].routes
+    int index = router[0].count sub 1
+    routes[index].checked = true
+    routes[index].schema = schema.value
+    routes[index].checks = checks
+    = true
+]
+
+pub fn advance_router [ptr Router router, int now] bool [
+    if [not router] [ = false ]
+    = cooldowns.advance_cooldowns router[0].cooldowns, now
+]
+
+fn resolve_checked [ptr Router router, models.Command command, int now, bool timed] RouteMatch [
+    if [not router or not command.ok or not models.valid_command_options command.options] [ = RouteMatch [false, 'invalid command or router', 0, '', '[]', 'invalid_command', '', 0] ]
+    if [timed and not advance_router router, now] [ = RouteMatch [false, 'cooldown clock failed or was not serviced', 0, '', '[]', 'cooldown_clock', '', 0] ]
+    str path = command.name
+    str options = command.options
+    int depth = 0
+    if [command.command_type eq 1] [
+        while [depth lt 2] [
+            json.Text first = json.element options, 0
+            if [not first.ok] [ break ]
+            json.Text raw_type = json.member first.value, 'type'
+            if [not str.eq raw_type.value, '1' and not str.eq raw_type.value, '2'] [ break ]
+            json.Text raw_name = json.member first.value, 'name'
+            json.Text name = json.text raw_name.value
+            models.CommandOption child = models.command_option options, name.value
+            if [not child.ok] [ = RouteMatch [false, 'invalid command branch', 0, '', '[]', 'invalid_branch', '', 0] ]
+            path = str.concat path, ' '
+            path = str.concat path, name.value
+            options = child.options
+            depth = depth add 1
+        ]
+    ]
+    ptr Route routes = router[0].routes
+    int i = 0
+    while [i lt router[0].count] [
+        if [routes[i].kind eq command.command_type and str.eq routes[i].path, path] [
+            if [routes[i].checked] [
+                validation.ArgumentCheck checked = validation.validate_options routes[i].schema, options
+                if [not checked.ok] [ = RouteMatch [false, checked.error, 0, path, '[]', checked.code, checked.parameter, 0] ]
+            ]
+            policy.PolicyCheck permitted = policy.check_policy routes[i].checks, command
+            if [not permitted.ok] [ = RouteMatch [false, permitted.error, 0, path, '[]', permitted.code, '', 0] ]
+            int duration = policy.cooldown_duration routes[i].checks
+            if [duration gt 0] [
+                if [not timed] [ = RouteMatch [false, 'cooldown route requires a sampled clock', 0, path, '[]', 'cooldown_clock_required', '', 0] ]
+                str subject = policy.cooldown_subject routes[i].checks, command
+                cooldowns.CooldownCheck admission = cooldowns.take_cooldown router[0].cooldowns, i, command.application_id, subject, duration, now
+                if [not admission.ok] [ = RouteMatch [false, admission.error, 0, path, '[]', admission.code, '', admission.retry_ms] ]
+            ]
+            = RouteMatch [true, '', routes[i].handler, path, options, '', '', 0]
+        ]
+        i = i add 1
+    ]
+    = RouteMatch [false, 'command route not registered', 0, path, '[]', 'route_missing', '', 0]
+]
+
+# Untimed lookup remains pure and never silently bypasses a configured cooldown.
+pub fn resolve_command [ptr Router router, models.Command command] RouteMatch [
+    = resolve_checked router, command, 0, false
+]
+
+# A successful timed resolution consumes the admission BEFORE application work;
+# handler/network failure does not refund it. Not a side-effect-free preview.
+pub fn resolve_command_at [ptr Router router, models.Command command, int now] RouteMatch [
+    = resolve_checked router, command, now, true
+]

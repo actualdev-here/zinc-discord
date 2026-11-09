@@ -1,0 +1,261 @@
+use 'zinc-json' as json
+use './rest.zn' as rest
+use './permissions.zn' as permissions
+
+# Small projections, not full Discord objects. Unknown fields stay in raw JSON.
+pub struct Message [
+    pub bool ok
+    pub str error
+    pub str id
+    pub str channel_id
+    pub str guild_id
+    pub str author_id
+    pub bool has_author
+    pub bool author_bot
+    pub bool has_content
+    pub str content
+]
+
+pub struct Command [
+    pub bool ok
+    pub str error
+    pub str id
+    pub str application_id
+    pub str token
+    pub str command_id
+    pub str name
+    pub int command_type
+    pub str user_id
+    pub str guild_id
+    pub str channel_id
+    pub str target_id
+    pub str options
+    pub str resolved
+    pub permissions.PermissionSet member_permissions
+    pub permissions.PermissionSet app_permissions
+]
+
+pub struct CommandOption [
+    pub bool ok
+    pub str error
+    pub str name
+    pub int kind
+    pub str value
+    pub str options
+]
+
+fn text_field [str source, str key] str [
+    json.Text raw = json.member source, key
+    json.Text text = json.text raw.value
+    = text.value
+]
+
+fn optional_id [str source, str key] bool [
+    json.Text raw = json.member source, key
+    if [not raw.ok] [ = true ]
+    json.Text text = json.text raw.value
+    = text.ok and rest.snowflake text.value
+]
+
+fn bad_message [] Message [
+    = Message [false, 'invalid message fields', '', '', '', '', false, false, false, '']
+]
+
+# Accepts partial MESSAGE_UPDATE payloads. Absence is distinct from empty content.
+pub fn decode_message [str source] Message [
+    if [not str.eq [json.kind source], 'object'] [ = bad_message [] ]
+    str id = text_field source, 'id'
+    str channel = text_field source, 'channel_id'
+    if [not rest.snowflake id or not rest.snowflake channel or not optional_id source, 'guild_id'] [ = bad_message [] ]
+    str guild = text_field source, 'guild_id'
+    Message result = Message [true, '', id, channel, guild, '', false, false, false, '']
+    json.Text content = json.member source, 'content'
+    if [content.ok] [
+        json.Text decoded = json.text content.value
+        if [not decoded.ok] [ = bad_message [] ]
+        result.has_content = true
+        result.content = decoded.value
+    ]
+    json.Text author = json.member source, 'author'
+    if [author.ok] [
+        if [not str.eq [json.kind author.value], 'object'] [ = bad_message [] ]
+        str user = text_field author.value, 'id'
+        if [not rest.snowflake user] [ = bad_message [] ]
+        json.Text bot = json.member author.value, 'bot'
+        if [bot.ok and not str.eq [json.kind bot.value], 'boolean'] [ = bad_message [] ]
+        result.has_author = true
+        result.author_id = user
+        result.author_bot = str.eq bot.value, 'true'
+    ]
+    = result
+]
+
+fn bad_option [] CommandOption [
+    = CommandOption [false, 'invalid or missing command option', '', 0, '', '[]']
+]
+
+fn option_value_valid [int kind, str value] bool [
+    str shape = json.kind value
+    if [kind eq 3] [ = str.eq shape, 'string' ]
+    if [kind eq 5] [ = str.eq shape, 'boolean' ]
+    if [kind eq 10] [ = str.eq shape, 'number' ]
+    if [kind eq 4] [
+        # Preserve signed 53-bit Discord integers without a 32-bit conversion.
+        str magnitude = value
+        if [str.starts magnitude, '-'] [ magnitude = str.slice magnitude, 1, str.len magnitude ]
+        if [not json.unsigned_decimal magnitude] [ = false ]
+        int n = str.len magnitude
+        if [n lt 16] [ = true ]
+        if [n gt 16] [ = false ]
+        str maximum = '9007199254740991'
+        int i = 0
+        while [i lt n] [
+            int digit = str.at magnitude, i
+            int max_digit = str.at maximum, i
+            if [digit lt max_digit] [ = true ]
+            if [digit gt max_digit] [ = false ]
+            i = i add 1
+        ]
+        = true
+    ]
+    if [kind eq 6 or kind eq 7 or kind eq 8 or kind eq 9 or kind eq 11] [
+        json.Text id = json.text value
+        = id.ok and rest.snowflake id.value
+    ]
+    = false
+]
+
+# Incoming selected options, not command registration definitions.
+# At most group -> subcommand -> scalar options, with <=25 entries per array.
+fn options_valid [str source, int level] bool [
+    if [level gt 2 or not str.eq [json.kind source], 'array'] [ = false ]
+    int i = 0
+    int branch = 0
+    while [i lt 26] [
+        json.Text raw = json.element source, i
+        if [not raw.ok] [ = true ]
+        if [i eq 25 or not str.eq [json.kind raw.value], 'object'] [ = false ]
+        str name = text_field raw.value, 'name'
+        if [str.len name eq 0 or str.len name gt 100] [ = false ]
+        int j = 0
+        while [j lt i] [
+            json.Text previous = json.element source, j
+            if [str.eq name, text_field previous.value, 'name'] [ = false ]
+            j = j add 1
+        ]
+        json.Text raw_kind = json.member raw.value, 'type'
+        json.Integer kind = json.unsigned_int raw_kind.value
+        if [not kind.ok] [ = false ]
+        json.Text value = json.member raw.value, 'value'
+        json.Text children = json.member raw.value, 'options'
+        if [kind.value eq 1 or kind.value eq 2] [
+            if [i ne 0 or level eq 2 or [kind.value eq 2 and level ne 0] or value.ok] [ = false ]
+            # Only the selected subcommand/group appears in an incoming command.
+            branch = kind.value
+            if [children.ok] [
+                int child_level = 2
+                if [kind.value eq 2] [ child_level = 1 ]
+                if [not options_valid children.value, child_level] [ = false ]
+            ]
+            if [kind.value eq 2] [
+                if [not children.ok] [ = false ]
+                json.Text first = json.element children.value, 0
+                json.Text child_kind = json.member first.value, 'type'
+                if [not str.eq child_kind.value, '1'] [ = false ]
+            ]
+        ]
+        else [
+            if [branch ne 0 or not value.ok or children.ok or not option_value_valid kind.value, value.value] [ = false ]
+        ]
+        if [i gt 0 and branch ne 0] [ = false ]
+        i = i add 1
+    ]
+    = false
+]
+
+pub fn command_option [str options, str name] CommandOption [
+    if [not options_valid options, 0] [ = bad_option [] ]
+    int i = 0
+    while [i lt 25] [
+        json.Text raw = json.element options, i
+        if [not raw.ok] [ break ]
+        if [str.eq [text_field raw.value, 'name'], name] [
+            json.Text raw_kind = json.member raw.value, 'type'
+            json.Integer kind = json.unsigned_int raw_kind.value
+            json.Text value = json.member raw.value, 'value'
+            json.Text children = json.member raw.value, 'options'
+            if [not children.ok] [ children.value = '[]' ]
+            = CommandOption [true, '', name, kind.value, value.value, children.value]
+        ]
+        i = i add 1
+    ]
+    = bad_option []
+]
+
+# Module bridge for schema validation of caller-constructed Command values.
+pub fn valid_command_options [str options] bool [
+    = options_valid options, 0
+]
+
+pub fn command_string [str options, str name] json.Text [
+    CommandOption option = command_option options, name
+    if [not option.ok or option.kind ne 3] [ = json.Text [false, ''] ]
+    = json.text option.value
+]
+
+fn bad_command [] Command [
+    # Error text is deliberately independent of secret-bearing input.
+    permissions.PermissionSet unknown = permissions.parse_permissions ''
+    = Command [false, 'invalid or unsupported application command interaction', '', '', '', '', '', 0, '', '', '', '', '[]', '{}', unknown, unknown]
+]
+
+pub fn decode_command [str source] Command [
+    if [not str.eq [json.kind source], 'object'] [ = bad_command [] ]
+    json.Text raw_kind = json.member source, 'type'
+    json.Integer kind = json.unsigned_int raw_kind.value
+    if [not kind.ok or kind.value ne 2] [ = bad_command [] ]
+    str id = text_field source, 'id'
+    str application = text_field source, 'application_id'
+    str token = text_field source, 'token'
+    rest.Request validated = rest.interaction_callback id, token, '{"type":5}'
+    if [not validated.ok or not rest.snowflake application] [ = bad_command [] ]
+    if [not optional_id source, 'guild_id' or not optional_id source, 'channel_id'] [ = bad_command [] ]
+    json.Text data = json.member source, 'data'
+    str command_id = text_field data.value, 'id'
+    str name = text_field data.value, 'name'
+    raw_kind = json.member data.value, 'type'
+    kind = json.unsigned_int raw_kind.value
+    if [not rest.snowflake command_id or str.len name eq 0 or str.len name gt 100 or not kind.ok or kind.value lt 1 or kind.value gt 3] [ = bad_command [] ]
+    json.Text raw_user = json.member source, 'user'
+    json.Text member = json.member source, 'member'
+    str user = text_field raw_user.value, 'id'
+    if [raw_user.ok and not rest.snowflake user] [ = bad_command [] ]
+    if [member.ok] [
+        json.Text member_user = json.member member.value, 'user'
+        str member_id = text_field member_user.value, 'id'
+        if [not rest.snowflake member_id or [raw_user.ok and not str.eq user, member_id]] [ = bad_command [] ]
+        user = member_id
+    ]
+    if [not rest.snowflake user] [ = bad_command [] ]
+    json.Text options = json.member data.value, 'options'
+    if [not options.ok] [ options.value = '[]' ]
+    if [not options_valid options.value, 0] [ = bad_command [] ]
+    json.Text resolved = json.member data.value, 'resolved'
+    if [not resolved.ok] [ resolved.value = '{}' ]
+    if [not str.eq [json.kind resolved.value], 'object'] [ = bad_command [] ]
+    str target = text_field data.value, 'target_id'
+    if [not optional_id data.value, 'target_id'] [ = bad_command [] ]
+    if [kind.value ne 1] [
+        if [not rest.snowflake target] [ = bad_command [] ]
+        json.Text first = json.element options.value, 0
+        if [first.ok] [ = bad_command [] ]
+    ]
+    str guild = text_field source, 'guild_id'
+    str channel = text_field source, 'channel_id'
+    # Missing/malformed permission metadata remains unknown, not a zero or a
+    # grant. Only policies requiring these fields reject it; replies still work.
+    permissions.PermissionSet member_mask = permissions.parse_permissions ''
+    if [str.len guild gt 0 and member.ok] [ member_mask = permissions.parse_permissions text_field member.value, 'permissions' ]
+    permissions.PermissionSet app_mask = permissions.parse_permissions text_field source, 'app_permissions'
+    = Command [true, '', id, application, token, command_id, name, kind.value, user, guild, channel, target, options.value, resolved.value, member_mask, app_mask]
+]

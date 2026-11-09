@@ -1,0 +1,246 @@
+use 'zinc-json' as json
+
+# Transport-neutral: never contains a bot token or performs a network request.
+pub struct Request [
+    pub bool ok
+    pub str method
+    pub str route
+    pub str body
+]
+
+pub fn api_base [] str [ = 'https://discord.com/api/v10' ]
+
+# Decimal uint64, kept as str because Zinc int is currently signed 32-bit.
+pub fn snowflake [str value] bool [
+    int n = str.len value
+    if [n eq 0 or n gt 20] [ = false ]
+    if [str.at value, 0 eq 48] [ = false ]
+    int i = 0
+    while [i lt n] [
+        int c = str.at value, i
+        if [c lt 48 or c gt 57] [ = false ]
+        i = i add 1
+    ]
+    if [n eq 20] [
+        str max = '18446744073709551615'
+        i = 0
+        while [i lt 20] [
+            int c = str.at value, i
+            int m = str.at max, i
+            if [c lt m] [ = true ]
+            if [c gt m] [ = false ]
+            i = i add 1
+        ]
+    ]
+    = true
+]
+
+fn bad_request [] Request [ = Request [false, '', '', ''] ]
+
+fn message_body [str content] str [
+    str body = str.concat '{"content":', json.quote content
+    # Explicitly disable all implicit mentions, including replied-user pings.
+    = str.concat body, ',"allowed_mentions":{"parse":[],"replied_user":false}}'
+]
+
+fn valid_content [str content] bool [
+    int n = str.len content
+    # Conservative byte cap. Discord measures characters; UTF-8 may fit fewer here.
+    if [n eq 0 or n gt 2000] [ = false ]
+    = json.valid json.quote content
+]
+
+pub fn current_user [] Request [ = Request [true, 'GET', '/users/@me', ''] ]
+pub fn gateway_bot [] Request [ = Request [true, 'GET', '/gateway/bot', ''] ]
+
+pub fn channel [str channel_id] Request [
+    if [not snowflake channel_id] [ = bad_request [] ]
+    str route = str.concat '/channels/', channel_id
+    = Request [true, 'GET', route, '']
+]
+
+fn messages_route [str channel_id] str [
+    str route = str.concat '/channels/', channel_id
+    = str.concat route, '/messages'
+]
+
+pub fn create_message [str channel_id, str content] Request [
+    if [not snowflake channel_id or not valid_content content] [ = bad_request [] ]
+    str route = messages_route channel_id
+    str body = message_body content
+    = Request [true, 'POST', route, body]
+]
+
+pub fn edit_message [str channel_id, str message_id, str content] Request [
+    if [not snowflake channel_id or not snowflake message_id or not valid_content content] [ = bad_request [] ]
+    str route = messages_route channel_id
+    route = str.concat route, '/'
+    route = str.concat route, message_id
+    = Request [true, 'PATCH', route, message_body content]
+]
+
+pub fn delete_message [str channel_id, str message_id] Request [
+    if [not snowflake channel_id or not snowflake message_id] [ = bad_request [] ]
+    str route = messages_route channel_id
+    route = str.concat route, '/'
+    route = str.concat route, message_id
+    = Request [true, 'DELETE', route, '']
+]
+
+pub fn create_dm [str user_id] Request [
+    if [not snowflake user_id] [ = bad_request [] ]
+    str body = str.concat '{"recipient_id":', json.quote user_id
+    body = str.concat body, '}'
+    = Request [true, 'POST', '/users/@me/channels', body]
+]
+
+fn commands_valid [str commands] bool [
+    if [not json.valid commands] [ = false ]
+    commands = str.trim commands
+    = str.at commands, 0 eq 91
+]
+
+pub fn global_commands [str application_id, str commands] Request [
+    if [not snowflake application_id or not commands_valid commands] [ = bad_request [] ]
+    str route = str.concat '/applications/', application_id
+    route = str.concat route, '/commands'
+    = Request [true, 'PUT', route, commands]
+]
+
+pub fn guild_commands [str application_id, str guild_id, str commands] Request [
+    if [not snowflake application_id or not snowflake guild_id or not commands_valid commands] [ = bad_request [] ]
+    str route = str.concat '/applications/', application_id
+    route = str.concat route, '/guilds/'
+    route = str.concat route, guild_id
+    route = str.concat route, '/commands'
+    = Request [true, 'PUT', route, commands]
+]
+
+# Callbacks are payloads, not routes: interaction tokens must not leak in logs.
+pub fn interaction_reply [str content, bool ephemeral] json.Text [
+    if [not valid_content content] [ = json.Text [false, ''] ]
+    str data = message_body content
+    if [ephemeral] [
+        data = str.slice data, 0, [str.len data sub 1]
+        data = str.concat data, ',"flags":64}'
+    ]
+    str body = str.concat '{"type":4,"data":', data
+    = json.Text [true, str.concat body, '}']
+]
+
+pub fn deferred_reply [bool ephemeral] str [
+    if [ephemeral] [ = '{"type":5,"data":{"flags":64}}' ]
+    = '{"type":5}'
+]
+
+pub fn interaction_callback [str interaction_id, str token, str payload] Request [
+    if [not snowflake interaction_id or not path_token token or not str.eq [json.kind payload], 'object'] [ = bad_request [] ]
+    str route = str.concat '/interactions/', interaction_id
+    route = str.concat route, '/'
+    route = str.concat route, token
+    route = str.concat route, '/callback'
+    = Request [true, 'POST', route, payload]
+]
+
+fn path_token [str token] bool [
+    if [str.len token eq 0 or str.len token gt 512] [ = false ]
+    int i = 0
+    while [i lt str.len token] [
+        int c = str.at token, i
+        if [c ge 48 and c le 57 or c ge 65 and c le 90 or c ge 97 and c le 122 or c eq 95 or c eq 45 or c eq 46] [ i = i add 1 ]
+        else [ = false ]
+    ]
+    = not str.eq token, '.' and not str.eq token, '..'
+]
+
+pub fn get_message [str channel_id, str message_id] Request [
+    Request request = delete_message channel_id, message_id
+    if [request.ok] [ request.method = 'GET' ]
+    = request
+]
+
+# A single page, not an unbounded iterator. Only one cursor may be selected.
+pub fn list_messages [str channel_id, int limit, str before, str after, str around] Request [
+    if [not snowflake channel_id or limit lt 1 or limit gt 100] [ = bad_request [] ]
+    int cursors = 0
+    str query = str.concat '?limit=', int.str limit
+    if [str.len before gt 0] [
+        if [not snowflake before] [ = bad_request [] ]
+        cursors = cursors add 1
+        query = str.concat query, '&before='
+        query = str.concat query, before
+    ]
+    if [str.len after gt 0] [
+        if [not snowflake after] [ = bad_request [] ]
+        cursors = cursors add 1
+        query = str.concat query, '&after='
+        query = str.concat query, after
+    ]
+    if [str.len around gt 0] [
+        if [not snowflake around] [ = bad_request [] ]
+        cursors = cursors add 1
+        query = str.concat query, '&around='
+        query = str.concat query, around
+    ]
+    if [cursors gt 1] [ = bad_request [] ]
+    str route = messages_route channel_id
+    route = str.concat route, query
+    = Request [true, 'GET', route, '']
+]
+
+fn webhook_route [str application_id, str token] str [
+    if [not snowflake application_id or not path_token token] [ = '' ]
+    str route = str.concat '/webhooks/', application_id
+    route = str.concat route, '/'
+    route = str.concat route, token
+    = route
+]
+
+fn webhook_message [str method, str application_id, str token, str message_id, str body] Request [
+    if [not str.eq message_id, '@original' and not snowflake message_id] [ = bad_request [] ]
+    str route = webhook_route application_id, token
+    if [str.len route eq 0] [ = bad_request [] ]
+    route = str.concat route, '/messages/'
+    route = str.concat route, message_id
+    = Request [true, method, route, body]
+]
+
+pub fn original_response [str application_id, str token] Request [
+    = webhook_message 'GET', application_id, token, '@original', ''
+]
+
+pub fn edit_original_response [str application_id, str token, str content] Request [
+    if [not valid_content content] [ = bad_request [] ]
+    str body = message_body content
+    = webhook_message 'PATCH', application_id, token, '@original', body
+]
+
+pub fn delete_original_response [str application_id, str token] Request [
+    = webhook_message 'DELETE', application_id, token, '@original', ''
+]
+
+pub fn create_followup [str application_id, str token, str content, bool ephemeral] Request [
+    if [not valid_content content] [ = bad_request [] ]
+    str route = webhook_route application_id, token
+    if [str.len route eq 0] [ = bad_request [] ]
+    json.Text callback = interaction_reply content, ephemeral
+    json.Text data = json.member callback.value, 'data'
+    if [not data.ok] [ = bad_request [] ]
+    = Request [true, 'POST', route, data.value]
+]
+
+pub fn get_followup [str application_id, str token, str message_id] Request [
+    if [not snowflake message_id] [ = bad_request [] ]
+    = webhook_message 'GET', application_id, token, message_id, ''
+]
+
+pub fn edit_followup [str application_id, str token, str message_id, str content] Request [
+    if [not snowflake message_id or not valid_content content] [ = bad_request [] ]
+    str body = message_body content
+    = webhook_message 'PATCH', application_id, token, message_id, body
+]
+
+pub fn delete_followup [str application_id, str token, str message_id] Request [
+    if [not snowflake message_id] [ = bad_request [] ]
+    = webhook_message 'DELETE', application_id, token, message_id, ''
+]

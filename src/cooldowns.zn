@@ -1,0 +1,120 @@
+use './rest.zn' as rest
+
+# Fixed numeric identity, no token, payload, or context pointer retention.
+struct Slot [
+    int route
+    int app0
+    int app1
+    int app2
+    int id0
+    int id1
+    int id2
+    int remaining
+]
+
+pub struct CooldownStore [
+    ptr Slot slots
+    int capacity
+    int size
+    int clock
+    bool initialized
+    bool failed
+]
+
+pub struct CooldownCheck [
+    pub bool ok
+    pub str code
+    pub str error
+    pub int retry_ms
+]
+
+pub fn new_cooldowns [int capacity] ptr CooldownStore [
+    if [capacity lt 1 or capacity gt 4096] [ = null ]
+    ptr CooldownStore store = sys.alloc 1
+    if [not store] [ = null ]
+    ptr Slot slots = sys.alloc capacity
+    if [not slots] [ sys.free store
+        = null
+    ]
+    store[0] = CooldownStore [slots, capacity, 0, 0, false, false]
+    = store
+]
+
+pub fn close_cooldowns [ptr CooldownStore store] int [
+    if [store] [ sys.free store[0].slots
+        sys.free store
+    ]
+    = 0
+]
+
+pub fn advance_cooldowns [ptr CooldownStore store, int now] bool [
+    if [not store or store[0].failed] [ = false ]
+    if [now lt 0 or now ge 1000000000] [ store[0].failed = true
+        = false
+    ]
+    if [not store[0].initialized] [ store[0].clock = now
+        store[0].initialized = true
+        = true
+    ]
+    int delta = now sub store[0].clock
+    if [delta lt 0] [ delta = delta add 1000000000 ]
+    if [delta ge 500000000] [ store[0].failed = true
+        = false
+    ]
+    store[0].clock = now
+    ptr Slot slots = store[0].slots
+    int i = 0
+    while [i lt store[0].size] [
+        if [delta ge slots[i].remaining] [ slots[i] = Slot [0, 0, 0, 0, 0, 0, 0, 0] ]
+        else [ slots[i].remaining = slots[i].remaining sub delta ]
+        i = i add 1
+    ]
+    = true
+]
+
+fn chunk [str id, int part] int [
+    int end = str.len id sub [part mul 7]
+    if [end le 0] [ = 0 ]
+    int start = end sub 7
+    if [start lt 0] [ start = 0 ]
+    int value = 0
+    while [start lt end] [
+        int digit = str.at id, start
+        value = value mul 10 add [digit sub 48]
+        start = start add 1
+    ]
+    = value
+]
+
+fn same [Slot a, Slot b] bool [
+    = a.route eq b.route and a.app0 eq b.app0 and a.app1 eq b.app1 and a.app2 eq b.app2 and a.id0 eq b.id0 and a.id1 eq b.id1 and a.id2 eq b.id2
+]
+
+pub fn take_cooldown [ptr CooldownStore store, int route, str application, str subject, int duration, int now] CooldownCheck [
+    if [route lt 0 or route gt 127 or not rest.snowflake application or [not str.eq subject, '0' and not rest.snowflake subject] or duration lt 1 or duration gt 900000] [ = CooldownCheck [false, 'invalid_cooldown', 'invalid cooldown identity or duration', 0] ]
+    if [not advance_cooldowns store, now] [ = CooldownCheck [false, 'cooldown_clock', 'cooldown clock failed or was not serviced', 0] ]
+    Slot candidate = Slot [route, 0, 0, 0, 0, 0, 0, duration]
+    candidate.app0 = chunk application, 0
+    candidate.app1 = chunk application, 1
+    candidate.app2 = chunk application, 2
+    candidate.id0 = chunk subject, 0
+    candidate.id1 = chunk subject, 1
+    candidate.id2 = chunk subject, 2
+    ptr Slot slots = store[0].slots
+    int free_slot = 0 sub 1
+    int i = 0
+    while [i lt store[0].size] [
+        if [slots[i].remaining gt 0] [
+            if [same slots[i], candidate] [ = CooldownCheck [false, 'cooldown', 'command cooldown active', slots[i].remaining] ]
+        ]
+        else [ if [free_slot lt 0] [ free_slot = i ] ]
+        i = i add 1
+    ]
+    if [free_slot lt 0] [
+        if [store[0].size ge store[0].capacity] [ = CooldownCheck [false, 'cooldown_capacity', 'cooldown capacity reached; active windows retained', 0] ]
+        free_slot = store[0].size
+        store[0].size = free_slot add 1
+    ]
+    slots[free_slot] = candidate
+    = CooldownCheck [true, '', '', 0]
+]

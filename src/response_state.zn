@@ -1,0 +1,92 @@
+# Pure, receipt-relative lifecycle kernel. Shared controllers own one state.
+pub struct ResponseState [
+    pub bool ok
+    pub str error
+    int phase
+    int received
+    bool deferring
+]
+
+pub fn new_response_state [int received_ms] ResponseState [
+    if [received_ms lt 0 or received_ms ge 1000000000] [
+        = ResponseState [false, 'invalid receipt clock', 0 sub 1, 0, false]
+    ]
+    = ResponseState [true, '', 0, received_ms, false]
+]
+
+fn age [ResponseState state, int now] int [
+    if [state.phase lt 0 or now lt 0 or now ge 1000000000] [ = 0 sub 1 ]
+    int elapsed = now sub state.received
+    if [elapsed lt 0] [ elapsed = elapsed add 1000000000 ]
+    = elapsed
+]
+
+pub fn response_phase [ResponseState state, int now] str [
+    int elapsed = age state, now
+    if [elapsed lt 0] [ = 'invalid' ]
+    if [elapsed ge 900000] [ = 'expired' ]
+    if [state.phase eq 0 and elapsed ge 3000] [ = 'expired' ]
+    if [state.phase eq 0] [ = 'pending' ]
+    if [state.phase eq 1] [ = 'sending' ]
+    if [state.phase eq 2] [ = 'replied' ]
+    if [state.phase eq 3] [ = 'deferred' ]
+    if [state.phase eq 4] [ = 'unknown' ]
+    = 'rejected'
+]
+
+pub fn response_remaining [ResponseState state, int now] int [
+    int elapsed = age state, now
+    if [elapsed lt 0] [ = 0 ]
+    int limit = 0
+    if [state.phase eq 0] [ limit = 3000 ]
+    if [state.phase eq 2 or state.phase eq 3] [ limit = 900000 ]
+    if [elapsed ge limit] [ = 0 ]
+    = limit sub elapsed
+]
+
+pub fn begin_response [ResponseState state, bool defer, int now] ResponseState [
+    if [not str.eq [response_phase state, now], 'pending'] [
+        state.ok = false
+        state.error = 'initial response is unavailable or already claimed'
+        = state
+    ]
+    state.ok = true
+    state.error = ''
+    state.phase = 1
+    state.deferring = defer
+    = state
+]
+
+pub fn finish_response [ResponseState state, bool success, bool dispatched, int status] ResponseState [
+    if [state.phase ne 1] [
+        state.ok = false
+        state.error = 'no initial response is in flight'
+        = state
+    ]
+    state.ok = success
+    state.error = ''
+    if [success] [
+        state.phase = 2
+        if [state.deferring] [ state.phase = 3 ]
+        = state
+    ]
+    state.error = 'initial response failed'
+    if [not dispatched or status eq 429] [ state.phase = 0
+        = state
+    ]
+    state.phase = 6
+    if [status eq 0 or status ge 500] [ state.phase = 4 ]
+    = state
+]
+
+pub fn complete_response [ResponseState state] ResponseState [
+    if [state.phase ne 2 and state.phase ne 3] [
+        state.ok = false
+        state.error = 'initial response has not been acknowledged'
+        = state
+    ]
+    state.phase = 2
+    state.ok = true
+    state.error = ''
+    = state
+]
